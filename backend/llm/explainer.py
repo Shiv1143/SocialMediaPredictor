@@ -1,21 +1,46 @@
 """
 Optional LLM explanation layer (Layer 3B).
 
-When OPENAI_API_KEY is set, this module generates a rich natural-language
-explanation of the prediction that a content manager can actually act on —
-instead of raw coefficient numbers.
+Uses a locally-running Ollama model to generate a rich natural-language
+explanation that a content manager can act on — instead of raw coefficient
+numbers.
 
-If no API key is available, it falls back to a structured template that
-is still more readable than raw Ridge coefficients.
+Configuration (environment variables):
+  OLLAMA_HOST   URL of the Ollama server (default: http://localhost:11434)
+  OLLAMA_MODEL  Model to use (default: llama3.2)
 
-The LLM is ONLY used for explanation generation — it does not affect the
+Falls back to a structured template explanation if Ollama is not reachable
+or if the call fails for any reason.
+
+The LLM is ONLY used for explanation generation — it never affects the
 predicted score, tier, or confidence. Those come from Ridge + KNN.
+
+Note: The OpenAI image vision path in main.py (_vision_summary) is separate
+and still uses OPENAI_API_KEY if set.
 """
 import logging
 import os
 from typing import Optional
 
+import httpx
+
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+_DEFAULT_HOST = "http://localhost:11434"
+_DEFAULT_MODEL = "llama3.2"
+
+
+def _ollama_host() -> str:
+    return os.getenv("OLLAMA_HOST", _DEFAULT_HOST).rstrip("/")
+
+
+def _ollama_model() -> str:
+    return os.getenv("OLLAMA_MODEL", _DEFAULT_MODEL)
+
 
 # ---------------------------------------------------------------------------
 # Public entry point
@@ -32,18 +57,16 @@ async def generate_explanation(
     """
     Generate a human-readable explanation for the prediction.
 
-    Falls back to a template-based explanation if no API key is set
-    or if the LLM call fails for any reason.
+    Tries Ollama first; falls back to a structured template if Ollama is
+    not running or returns an error.
     """
-    api_key = os.getenv("OPENAI_API_KEY")
-    if api_key:
-        try:
-            return await _llm_explanation(
-                post, prediction, similar_posts, key_factors,
-                brand_stats, brand_alignment_score, api_key
-            )
-        except Exception as e:
-            logger.warning("LLM explanation failed (%s), using template fallback", e)
+    try:
+        return await _ollama_explanation(
+            post, prediction, similar_posts, key_factors,
+            brand_stats, brand_alignment_score
+        )
+    except Exception as e:
+        logger.warning("Ollama explanation failed (%s), using template fallback", e)
 
     return _template_explanation(
         post, prediction, similar_posts, key_factors,
@@ -52,14 +75,15 @@ async def generate_explanation(
 
 
 # ---------------------------------------------------------------------------
-# LLM path
+# Ollama path
 # ---------------------------------------------------------------------------
 
-async def _llm_explanation(
+async def _ollama_explanation(
     post, prediction, similar_posts, key_factors,
-    brand_stats, brand_alignment_score, api_key
+    brand_stats, brand_alignment_score
 ) -> str:
-    from openai import AsyncOpenAI
+    host = _ollama_host()
+    model = _ollama_model()
 
     brand = post.get("brand", "unknown").replace("_", " ")
     tier = prediction.get("performance_tier", "medium")
@@ -75,7 +99,7 @@ async def _llm_explanation(
             f"→ {sp['engagement_rate']}% ER ({sp['performance_tier']})\n"
         )
 
-    # Build factor context (top 3 positive + top 3 negative)
+    # Positive / negative factor context
     positives = [f for f in key_factors if f["impact"] == "positive"][:3]
     negatives = [f for f in key_factors if f["impact"] == "negative"][:3]
     factor_context = ""
@@ -93,6 +117,7 @@ async def _llm_explanation(
             "It may be exploring a new content direction."
         )
 
+    # Collaborator tier note
     collab_note = ""
     collab_tier = post.get("collaborator_tier", 0)
     if collab_tier > 0:
@@ -123,18 +148,26 @@ Write a 3-4 sentence explanation a content manager can act on. Be specific about
 
 Do NOT use bullet points. Write in plain, direct prose. Keep it under 120 words."""
 
-    client = AsyncOpenAI(api_key=api_key)
-    response = await client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=180,
-        temperature=0.4,
-    )
-    return response.choices[0].message.content.strip()
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(
+            f"{host}/api/generate",
+            json={
+                "model": model,
+                "prompt": prompt,
+                "stream": False,
+                "options": {
+                    "temperature": 0.4,
+                    "num_predict": 200,
+                },
+            },
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data["response"].strip()
 
 
 # ---------------------------------------------------------------------------
-# Template fallback (no API key)
+# Template fallback (Ollama not available)
 # ---------------------------------------------------------------------------
 
 def _template_explanation(
@@ -149,7 +182,6 @@ def _template_explanation(
 
     tier_label = {"low": "below average", "medium": "average", "high": "above average"}[tier]
 
-    # Describe top positive/negative factors in plain English
     positives = [f["description"] for f in key_factors if f["impact"] == "positive"][:2]
     negatives = [f["description"] for f in key_factors if f["impact"] == "negative"][:2]
 
