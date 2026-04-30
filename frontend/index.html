@@ -1,0 +1,561 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Instagram Performance Predictor</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #0f0f13;
+      --surface: #1a1a22;
+      --surface2: #22222e;
+      --border: #2e2e3e;
+      --accent: #7c6af7;
+      --accent2: #56cfb2;
+      --text: #e8e8f0;
+      --muted: #7a7a90;
+      --low: #e05c5c;
+      --med: #e5a04a;
+      --high: #56cfb2;
+      --radius: 12px;
+      --font: 'Inter', system-ui, -apple-system, sans-serif;
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font);
+      min-height: 100vh;
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+    }
+
+    /* ── Header ── */
+    header {
+      padding: 20px 32px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }
+    .logo { font-size: 22px; font-weight: 700; letter-spacing: -0.5px; }
+    .logo span { color: var(--accent); }
+    .badge {
+      font-size: 11px;
+      background: var(--accent);
+      color: #fff;
+      padding: 3px 8px;
+      border-radius: 20px;
+      font-weight: 600;
+      letter-spacing: 0.5px;
+    }
+
+    /* ── Layout ── */
+    main {
+      display: grid;
+      grid-template-columns: 420px 1fr;
+      gap: 24px;
+      padding: 32px;
+      max-width: 1200px;
+      margin: 0 auto;
+      width: 100%;
+    }
+
+    @media (max-width: 900px) {
+      main { grid-template-columns: 1fr; }
+    }
+
+    /* ── Cards ── */
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 24px;
+    }
+    .card-title {
+      font-size: 14px;
+      font-weight: 600;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      margin-bottom: 20px;
+    }
+
+    /* ── Form ── */
+    .form-group { margin-bottom: 16px; }
+    label {
+      display: block;
+      font-size: 13px;
+      font-weight: 500;
+      margin-bottom: 6px;
+      color: var(--muted);
+    }
+    input, select, textarea {
+      width: 100%;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text);
+      font-size: 14px;
+      font-family: var(--font);
+      padding: 10px 14px;
+      transition: border-color 0.2s;
+      outline: none;
+    }
+    input:focus, select:focus, textarea:focus { border-color: var(--accent); }
+    textarea { resize: vertical; min-height: 90px; }
+    select option { background: var(--surface2); }
+
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+
+    /* Upload zone */
+    .upload-zone {
+      border: 2px dashed var(--border);
+      border-radius: 8px;
+      padding: 20px;
+      text-align: center;
+      cursor: pointer;
+      transition: border-color 0.2s, background 0.2s;
+      position: relative;
+    }
+    .upload-zone:hover { border-color: var(--accent); background: rgba(124,106,247,0.05); }
+    .upload-zone input { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
+    .upload-zone .icon { font-size: 28px; margin-bottom: 6px; }
+    .upload-zone p { font-size: 13px; color: var(--muted); }
+    .upload-zone.has-file { border-color: var(--accent2); }
+    .upload-zone.has-file p { color: var(--accent2); }
+
+    /* Submit button */
+    .btn-predict {
+      width: 100%;
+      padding: 14px;
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      font-size: 15px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: opacity 0.2s, transform 0.1s;
+      margin-top: 4px;
+    }
+    .btn-predict:hover { opacity: 0.9; }
+    .btn-predict:active { transform: scale(0.98); }
+    .btn-predict:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    /* ── Result panel ── */
+    #result-panel { display: none; }
+
+    /* Tier badge */
+    .tier-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 14px;
+      border-radius: 20px;
+      font-weight: 700;
+      font-size: 15px;
+      margin-bottom: 16px;
+    }
+    .tier-high  { background: rgba(86,207,178,0.15); color: var(--high); }
+    .tier-medium{ background: rgba(229,160,74,0.15);  color: var(--med); }
+    .tier-low   { background: rgba(224,92,92,0.15);   color: var(--low); }
+
+    /* Score bar */
+    .score-row { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+    .score-label { font-size: 13px; color: var(--muted); min-width: 130px; }
+    .score-bar-wrap { flex: 1; background: var(--surface2); border-radius: 4px; height: 8px; overflow: hidden; }
+    .score-bar { height: 100%; border-radius: 4px; transition: width 0.6s ease; background: var(--accent); }
+    .score-val { font-size: 13px; font-weight: 600; min-width: 46px; text-align: right; }
+
+    /* Summary */
+    .summary-text {
+      font-size: 14px;
+      line-height: 1.6;
+      color: var(--muted);
+      background: var(--surface2);
+      border-radius: 8px;
+      padding: 14px;
+      margin-bottom: 20px;
+    }
+
+    /* Key factors */
+    .section-label {
+      font-size: 12px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      color: var(--muted);
+      margin: 20px 0 10px;
+    }
+
+    .factor-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 9px 0;
+      border-bottom: 1px solid var(--border);
+      font-size: 13px;
+    }
+    .factor-row:last-child { border-bottom: none; }
+    .factor-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+    .pos { background: var(--high); }
+    .neg { background: var(--low); }
+    .factor-desc { flex: 1; }
+    .factor-contrib {
+      font-weight: 600;
+      font-size: 12px;
+      min-width: 50px;
+      text-align: right;
+    }
+    .factor-contrib.pos-text { color: var(--high); }
+    .factor-contrib.neg-text { color: var(--low); }
+
+    /* Similar posts */
+    .similar-post {
+      padding: 12px;
+      background: var(--surface2);
+      border-radius: 8px;
+      margin-bottom: 8px;
+      font-size: 13px;
+    }
+    .similar-post-header {
+      display: flex;
+      justify-content: space-between;
+      margin-bottom: 5px;
+    }
+    .sim-brand { font-weight: 600; color: var(--accent); }
+    .sim-tier { font-size: 11px; padding: 2px 8px; border-radius: 10px; font-weight: 600; }
+    .sim-caption { color: var(--muted); line-height: 1.5; margin-bottom: 6px; }
+    .sim-meta { display: flex; gap: 14px; font-size: 12px; color: var(--muted); }
+    .sim-meta span { display: flex; align-items: center; gap: 4px; }
+
+    /* Brand context box */
+    .brand-ctx {
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr;
+      gap: 12px;
+      margin-top: 8px;
+    }
+    .ctx-item {
+      background: var(--surface2);
+      border-radius: 8px;
+      padding: 12px;
+      text-align: center;
+    }
+    .ctx-val { font-size: 20px; font-weight: 700; color: var(--accent2); }
+    .ctx-label { font-size: 11px; color: var(--muted); margin-top: 4px; }
+
+    /* Loading spinner */
+    .spinner {
+      width: 20px; height: 20px;
+      border: 2px solid rgba(255,255,255,0.2);
+      border-top-color: #fff;
+      border-radius: 50%;
+      animation: spin 0.7s linear infinite;
+      display: inline-block;
+      vertical-align: middle;
+      margin-right: 8px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* Error */
+    .error-box {
+      background: rgba(224,92,92,0.1);
+      border: 1px solid rgba(224,92,92,0.3);
+      border-radius: 8px;
+      padding: 14px;
+      color: var(--low);
+      font-size: 14px;
+    }
+
+    footer {
+      text-align: center;
+      padding: 16px;
+      font-size: 12px;
+      color: var(--muted);
+      border-top: 1px solid var(--border);
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="logo">Consuma <span>Predict</span></div>
+  <div class="badge">AI Engineer Assignment</div>
+</header>
+
+<main>
+  <!-- ── Input Form ── -->
+  <div>
+    <div class="card">
+      <div class="card-title">Post Draft</div>
+
+      <div class="form-group">
+        <label for="brand">Brand</label>
+        <select id="brand">
+          <option value="">Loading brands…</option>
+        </select>
+      </div>
+
+      <div class="form-group">
+        <label for="caption">Caption</label>
+        <textarea id="caption" placeholder="Write your post caption here…"></textarea>
+      </div>
+
+      <div class="row">
+        <div class="form-group">
+          <label for="media_type">Content Type</label>
+          <select id="media_type">
+            <option value="reel">Reel</option>
+            <option value="post">Static Post</option>
+            <option value="album">Album / Carousel</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label for="duration">Duration (seconds)</label>
+          <input id="duration" type="number" min="1" max="600" placeholder="e.g. 30" />
+        </div>
+      </div>
+
+      <div class="form-group">
+        <label for="collaborators">Collaborators <span style="color:var(--muted);font-weight:400">(comma-separated)</span></label>
+        <input id="collaborators" type="text" placeholder="e.g. virat.kohli, hardikpandya7" />
+      </div>
+
+      <div class="form-group">
+        <label for="posted_at">Planned Publish Time <span style="color:var(--muted);font-weight:400">(optional)</span></label>
+        <input id="posted_at" type="datetime-local" />
+      </div>
+
+      <div class="form-group">
+        <label>Upload Creative Image <span style="color:var(--muted);font-weight:400">(optional)</span></label>
+        <div class="upload-zone" id="upload-zone">
+          <input type="file" id="image-file" accept="image/*" />
+          <div class="icon">🖼</div>
+          <p id="upload-label">Click or drag to upload an image</p>
+        </div>
+      </div>
+
+      <div class="form-group">
+        <label for="visual_summary">Visual Description <span style="color:var(--muted);font-weight:400">(or auto-generate from image above)</span></label>
+        <textarea id="visual_summary" rows="3" placeholder="Describe what's in the creative: people, text on screen, brand elements, mood…"></textarea>
+      </div>
+
+      <button class="btn-predict" id="predict-btn" onclick="submitPrediction()">
+        Predict Performance
+      </button>
+    </div>
+  </div>
+
+  <!-- ── Result Panel ── -->
+  <div>
+    <div class="card" id="result-panel">
+      <div class="card-title">Prediction Result</div>
+      <div id="result-content"></div>
+    </div>
+
+    <div class="card" id="placeholder-card" style="display:flex;align-items:center;justify-content:center;height:300px;flex-direction:column;gap:12px;">
+      <div style="font-size:40px">📊</div>
+      <div style="color:var(--muted);font-size:15px">Fill in the form and hit Predict</div>
+      <div style="color:var(--muted);font-size:13px">You'll see engagement prediction + explanation here</div>
+    </div>
+  </div>
+</main>
+
+<footer>Consuma Technologies — AI Engineer Assignment &nbsp;·&nbsp; Powered by Sentence Transformers + Ridge Regression</footer>
+
+<script>
+const API = '';  // same origin
+
+// ── Load brands ──
+async function loadBrands() {
+  try {
+    const res = await fetch(`${API}/brands`);
+    const { brands } = await res.json();
+    const sel = document.getElementById('brand');
+    sel.innerHTML = brands.map(b =>
+      `<option value="${b}">${b.replace(/_/g,' ').replace(/\b\w/g,c=>c.toUpperCase())}</option>`
+    ).join('');
+  } catch(e) {
+    console.error('Could not load brands', e);
+  }
+}
+loadBrands();
+
+// ── Image upload UI ──
+document.getElementById('image-file').addEventListener('change', function() {
+  const zone = document.getElementById('upload-zone');
+  const label = document.getElementById('upload-label');
+  if (this.files && this.files[0]) {
+    zone.classList.add('has-file');
+    label.textContent = `✓ ${this.files[0].name}`;
+  }
+});
+
+// ── Submit ──
+async function submitPrediction() {
+  const btn = document.getElementById('predict-btn');
+  const caption = document.getElementById('caption').value.trim();
+  const brand = document.getElementById('brand').value;
+
+  if (!caption) { alert('Please enter a caption.'); return; }
+  if (!brand)   { alert('Please select a brand.'); return; }
+
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>Predicting…';
+
+  const form = new FormData();
+  form.append('caption', caption);
+  form.append('brand', brand);
+  form.append('media_type', document.getElementById('media_type').value);
+
+  const dur = document.getElementById('duration').value;
+  if (dur) form.append('duration', dur);
+
+  const collab = document.getElementById('collaborators').value.trim();
+  if (collab) {
+    form.append('collaborators', collab);
+    form.append('is_collaborated', 'true');
+  } else {
+    form.append('is_collaborated', 'false');
+  }
+
+  const postedAt = document.getElementById('posted_at').value;
+  if (postedAt) form.append('posted_at', new Date(postedAt).toISOString());
+
+  const vs = document.getElementById('visual_summary').value.trim();
+  if (vs) form.append('visual_summary', vs);
+
+  const imgFile = document.getElementById('image-file').files[0];
+  if (imgFile) form.append('image', imgFile);
+
+  try {
+    const res = await fetch(`${API}/api/predict/upload`, { method: 'POST', body: form });
+    if (!res.ok) {
+      const err = await res.json();
+      throw new Error(err.detail || `HTTP ${res.status}`);
+    }
+    const data = await res.json();
+    renderResult(data);
+  } catch(e) {
+    renderError(e.message);
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = 'Predict Performance';
+  }
+}
+
+// ── Render result ──
+function renderResult(d) {
+  document.getElementById('placeholder-card').style.display = 'none';
+  const panel = document.getElementById('result-panel');
+  panel.style.display = 'block';
+
+  const tier = d.performance_tier;
+  const tierColor = { high: 'high', medium: 'medium', low: 'low' }[tier] || 'medium';
+  const tierIcon  = { high: '🚀', medium: '📈', low: '📉' }[tier] || '📊';
+  const exp = d.explanation || {};
+  const bc  = exp.brand_context || {};
+  const md  = d.model_details  || {};
+
+  let html = `
+    <div class="tier-badge tier-${tierColor}">${tierIcon} ${tier.charAt(0).toUpperCase()+tier.slice(1)} Performance</div>
+
+    <div class="score-row">
+      <div class="score-label">Engagement Rate</div>
+      <div class="score-bar-wrap"><div class="score-bar" style="width:${Math.min(d.predicted_engagement_rate,20)/20*100}%;background:var(--accent2)"></div></div>
+      <div class="score-val">${d.predicted_engagement_rate}%</div>
+    </div>
+    <div class="score-row">
+      <div class="score-label">Brand Score</div>
+      <div class="score-bar-wrap"><div class="score-bar" style="width:${d.brand_normalized_score*100}%"></div></div>
+      <div class="score-val">${(d.brand_normalized_score*100).toFixed(0)}%ile</div>
+    </div>
+    <div class="score-row">
+      <div class="score-label">Confidence</div>
+      <div class="score-bar-wrap"><div class="score-bar" style="width:${d.confidence*100}%;background:#e5a04a"></div></div>
+      <div class="score-val">${(d.confidence*100).toFixed(0)}%</div>
+    </div>
+
+    <div class="summary-text">${exp.summary || ''}</div>
+  `;
+
+  // Brand context
+  html += `
+    <div class="section-label">Brand Context</div>
+    <div class="brand-ctx">
+      <div class="ctx-item"><div class="ctx-val">${bc.estimated_er ?? d.predicted_engagement_rate}%</div><div class="ctx-label">Your Predicted ER</div></div>
+      <div class="ctx-item"><div class="ctx-val">${bc.brand_median_er ?? '–'}%</div><div class="ctx-label">Brand Median ER</div></div>
+      <div class="ctx-item"><div class="ctx-val">${(d.confidence*100).toFixed(0)}%</div><div class="ctx-label">Model Confidence</div></div>
+    </div>
+  `;
+
+  // Key factors
+  const factors = exp.key_factors || [];
+  if (factors.length) {
+    html += `<div class="section-label">Key Driving Factors</div>`;
+    factors.forEach(f => {
+      const isPos = f.impact === 'positive';
+      const sign  = isPos ? '+' : '';
+      html += `
+        <div class="factor-row">
+          <div class="factor-dot ${isPos ? 'pos' : 'neg'}"></div>
+          <div class="factor-desc">${f.description}</div>
+          <div class="factor-contrib ${isPos ? 'pos-text' : 'neg-text'}">${sign}${f.contribution.toFixed(3)}</div>
+        </div>
+      `;
+    });
+  }
+
+  // Similar posts
+  const simPosts = exp.similar_posts || [];
+  if (simPosts.length) {
+    html += `<div class="section-label">Most Similar Historical Posts</div>`;
+    simPosts.slice(0, 4).forEach(p => {
+      const tc = { high: 'tier-high', medium: 'tier-medium', low: 'tier-low' }[p.performance_tier] || 'tier-medium';
+      const simPct = (p.similarity_score * 100).toFixed(0);
+      html += `
+        <div class="similar-post">
+          <div class="similar-post-header">
+            <span class="sim-brand">${p.brand.replace(/_/g,' ')}</span>
+            <span class="sim-tier ${tc}">${p.performance_tier}</span>
+          </div>
+          <div class="sim-caption">${p.caption_snippet}</div>
+          <div class="sim-meta">
+            <span>📊 ${p.engagement_rate}% ER</span>
+            <span>🎬 ${p.media_type}</span>
+            <span>🎯 ${simPct}% match</span>
+            ${p.url ? `<span><a href="${p.url}" target="_blank" style="color:var(--accent)">View post ↗</a></span>` : ''}
+          </div>
+        </div>
+      `;
+    });
+  }
+
+  // Model internals (collapsed by default)
+  html += `
+    <div class="section-label">Model Internals</div>
+    <div style="font-size:12px;color:var(--muted);background:var(--surface2);border-radius:8px;padding:12px;display:grid;grid-template-columns:1fr 1fr;gap:8px">
+      <div>Ridge score: <b style="color:var(--text)">${md.ridge_score}</b></div>
+      <div>KNN score: <b style="color:var(--text)">${md.knn_score}</b></div>
+      <div>Ridge weight: <b style="color:var(--text)">${md.ridge_weight}</b></div>
+      <div>KNN weight: <b style="color:var(--text)">${md.knn_weight}</b></div>
+    </div>
+  `;
+
+  document.getElementById('result-content').innerHTML = html;
+}
+
+function renderError(msg) {
+  document.getElementById('placeholder-card').style.display = 'none';
+  const panel = document.getElementById('result-panel');
+  panel.style.display = 'block';
+  document.getElementById('result-content').innerHTML =
+    `<div class="error-box">⚠️ <b>Error:</b> ${msg}</div>`;
+}
+</script>
+</body>
+</html>

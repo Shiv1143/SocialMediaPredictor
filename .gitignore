@@ -1,0 +1,30 @@
+# Virtual environment
+assignment/
+
+# uv binary
+.uv/
+
+# Trained model artifacts (large binary files — regenerate with `python train.py`)
+saved_models/hybrid_predictor.joblib
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# Environment
+.env
+.env.*
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp

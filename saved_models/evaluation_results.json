@@ -1,0 +1,371 @@
+{
+  "cross_validation_lobo": {
+    "strategy": "Leave-One-Brand-Out (LOBO)",
+    "interpretation": "Each fold trains on 4 brands and evaluates on the 5th. This simulates deploying the model on a brand it has never seen. Spearman correlation measures whether the model correctly ranks posts from low to high engagement within a new brand.",
+    "fold_results": [
+      {
+        "brand_left_out": "cocacola_india",
+        "n_test": 120,
+        "mae": 0.2558,
+        "rmse": 0.297,
+        "spearman": -0.0258,
+        "spearman_p_value": 0.7796,
+        "tier_accuracy": 0.3167
+      },
+      {
+        "brand_left_out": "pepsiindia",
+        "n_test": 58,
+        "mae": 0.2585,
+        "rmse": 0.2986,
+        "spearman": -0.0499,
+        "spearman_p_value": 0.7097,
+        "tier_accuracy": 0.3448
+      },
+      {
+        "brand_left_out": "redbullindia",
+        "n_test": 119,
+        "mae": 0.2652,
+        "rmse": 0.3138,
+        "spearman": -0.1681,
+        "spearman_p_value": 0.0676,
+        "tier_accuracy": 0.3277
+      },
+      {
+        "brand_left_out": "sprite_india",
+        "n_test": 46,
+        "mae": 0.2657,
+        "rmse": 0.2934,
+        "spearman": 0.148,
+        "spearman_p_value": 0.3262,
+        "tier_accuracy": 0.2826
+      },
+      {
+        "brand_left_out": "thumsupofficial",
+        "n_test": 35,
+        "mae": 0.2481,
+        "rmse": 0.2947,
+        "spearman": 0.1737,
+        "spearman_p_value": 0.3184,
+        "tier_accuracy": 0.3714
+      }
+    ],
+    "mean_mae": 0.2587,
+    "mean_rmse": 0.2995,
+    "mean_spearman": 0.0156,
+    "mean_tier_accuracy": 0.3286
+  },
+  "cross_validation_within_brand": {
+    "strategy": "Within-Brand K-Fold (k=3)",
+    "interpretation": "Each brand's posts are split k-fold; model trained on other brands + that brand's training fold, tested on holdout fold. This measures ranking ability within a known brand \u2014 the primary deployment scenario. More honest than in-sample Spearman, less pessimistic than LOBO.",
+    "brand_results": [
+      {
+        "brand": "cocacola_india",
+        "n_posts": 120,
+        "k_folds": 3,
+        "mean_spearman": 0.1385,
+        "mean_mae": 0.2493
+      },
+      {
+        "brand": "pepsiindia",
+        "n_posts": 58,
+        "k_folds": 3,
+        "mean_spearman": -0.2057,
+        "mean_mae": 0.2684
+      },
+      {
+        "brand": "redbullindia",
+        "n_posts": 119,
+        "k_folds": 3,
+        "mean_spearman": 0.13,
+        "mean_mae": 0.2484
+      },
+      {
+        "brand": "sprite_india",
+        "n_posts": 46,
+        "k_folds": 3,
+        "mean_spearman": 0.4513,
+        "mean_mae": 0.2332
+      },
+      {
+        "brand": "thumsupofficial",
+        "n_posts": 35,
+        "k_folds": 3,
+        "mean_spearman": -0.3545,
+        "mean_mae": 0.2712
+      }
+    ],
+    "overall_mean_spearman": 0.0319
+  },
+  "baselines": {
+    "always_0.5": {
+      "description": "Always predict 0.5 \u2014 the global expected value of the normalised score",
+      "mae": 0.2502,
+      "rmse": 0.289,
+      "spearman": 0.0
+    },
+    "brand_mean": {
+      "description": "Predict each brand's mean normalised score (requires knowing the brand)",
+      "mae": 0.25,
+      "rmse": 0.2887,
+      "spearman": 0.0213
+    },
+    "brand_median": {
+      "description": "Predict each brand's median normalised score",
+      "mae": 0.25,
+      "rmse": 0.2887,
+      "spearman": 0.0203
+    },
+    "random": {
+      "description": "Random uniform prediction between 0 and 1",
+      "mae": 0.3352,
+      "rmse": 0.4067,
+      "spearman": -0.0012
+    }
+  },
+  "per_brand_insample": [
+    {
+      "brand": "cocacola_india",
+      "n_posts": 120,
+      "mae": 0.2179,
+      "rmse": 0.2499,
+      "spearman": 0.5735,
+      "note": "In-sample \u2014 inflated vs LOBO CV above"
+    },
+    {
+      "brand": "pepsiindia",
+      "n_posts": 58,
+      "mae": 0.2296,
+      "rmse": 0.2632,
+      "spearman": 0.4904,
+      "note": "In-sample \u2014 inflated vs LOBO CV above"
+    },
+    {
+      "brand": "redbullindia",
+      "n_posts": 119,
+      "mae": 0.2143,
+      "rmse": 0.2508,
+      "spearman": 0.5485,
+      "note": "In-sample \u2014 inflated vs LOBO CV above"
+    },
+    {
+      "brand": "sprite_india",
+      "n_posts": 46,
+      "mae": 0.2003,
+      "rmse": 0.2298,
+      "spearman": 0.7177,
+      "note": "In-sample \u2014 inflated vs LOBO CV above"
+    },
+    {
+      "brand": "thumsupofficial",
+      "n_posts": 35,
+      "mae": 0.2275,
+      "rmse": 0.2736,
+      "spearman": 0.3174,
+      "note": "In-sample \u2014 inflated vs LOBO CV above"
+    }
+  ],
+  "tier_accuracy": {
+    "overall_accuracy": 0.3783,
+    "per_tier": {
+      "low": {
+        "precision": 1.0,
+        "recall": 0.0252,
+        "f1": 0.0492
+      },
+      "medium": {
+        "precision": 0.3546,
+        "recall": 0.9846,
+        "f1": 0.5214
+      },
+      "high": {
+        "precision": 0.8571,
+        "recall": 0.093,
+        "f1": 0.1678
+      }
+    },
+    "note": "In-sample results \u2014 LOBO CV tier_accuracy above is the honest estimate"
+  },
+  "failure_analysis": {
+    "worst_10_predictions": [
+      {
+        "brand": "redbullindia",
+        "media_type": "reel",
+        "caption_snippet": "Delhi,NCR ki hawa ab thodi aur tez hai \ud83d\udd25\ud83c\uddee\ud83c\uddf3 \n\n#RedBull #RedBullIndia #",
+        "true_score": 0.037,
+        "predicted_score": 0.568,
+        "absolute_error": 0.531,
+        "true_tier": "low",
+        "predicted_tier": "medium",
+        "engagement_rate": 0.46
+      },
+      {
+        "brand": "cocacola_india",
+        "media_type": "album",
+        "caption_snippet": "Warning, looking at these images from Baba\u2019s Chicken Ludhiana can give you a ser\u2026",
+        "true_score": 0.087,
+        "predicted_score": 0.598,
+        "absolute_error": 0.511,
+        "true_tier": "low",
+        "predicted_tier": "medium",
+        "engagement_rate": 0.11
+      },
+      {
+        "brand": "redbullindia",
+        "media_type": "reel",
+        "caption_snippet": "Not all heroes wear capes, some drive the thiccshaw and come to Duo's rescue \ud83d\ude0c",
+        "true_score": 0.991,
+        "predicted_score": 0.496,
+        "absolute_error": 0.495,
+        "true_tier": "high",
+        "predicted_tier": "medium",
+        "engagement_rate": 15.52
+      },
+      {
+        "brand": "redbullindia",
+        "media_type": "reel",
+        "caption_snippet": "India\u2019s top creators racing an F1 driver\u2049\ufe0fYeah, this escalated fast \ud83d\ude2e\u200d\ud83d\udca8\ud83c\udfce\ufe0f\nJust a\u2026",
+        "true_score": 0.019,
+        "predicted_score": 0.499,
+        "absolute_error": 0.48,
+        "true_tier": "low",
+        "predicted_tier": "medium",
+        "engagement_rate": 0.24
+      },
+      {
+        "brand": "cocacola_india",
+        "media_type": "reel",
+        "caption_snippet": "Some magical words we definitely knew we needed.\n\n#cocacolaindia #realmagic #coc\u2026",
+        "true_score": 0.995,
+        "predicted_score": 0.528,
+        "absolute_error": 0.467,
+        "true_tier": "high",
+        "predicted_tier": "medium",
+        "engagement_rate": 12.19
+      },
+      {
+        "brand": "thumsupofficial",
+        "media_type": "reel",
+        "caption_snippet": "Colombo, you\u2019re about to feel the power in the presence. We\u2019re here to take over\u2026",
+        "true_score": 0.923,
+        "predicted_score": 0.458,
+        "absolute_error": 0.465,
+        "true_tier": "high",
+        "predicted_tier": "medium",
+        "engagement_rate": 4.24
+      },
+      {
+        "brand": "redbullindia",
+        "media_type": "reel",
+        "caption_snippet": "A1 in every way \ud83e\udee1\ud83d\udd25 @arvid.lindblad",
+        "true_score": 0.028,
+        "predicted_score": 0.492,
+        "absolute_error": 0.464,
+        "true_tier": "low",
+        "predicted_tier": "medium",
+        "engagement_rate": 0.27
+      },
+      {
+        "brand": "redbullindia",
+        "media_type": "reel",
+        "caption_snippet": "WE HEARD YOU\ud83d\udc42 \nWe knew you were waiting for THIS\u203c\ufe0f Formula 1 comes back to India\u2026",
+        "true_score": 0.148,
+        "predicted_score": 0.609,
+        "absolute_error": 0.461,
+        "true_tier": "low",
+        "predicted_tier": "medium",
+        "engagement_rate": 2.19
+      },
+      {
+        "brand": "redbullindia",
+        "media_type": "reel",
+        "caption_snippet": "@shreeaa.rathi , one of our DETermined Ambassadors, met @arvid.lindblad at Red B\u2026",
+        "true_score": 0.009,
+        "predicted_score": 0.469,
+        "absolute_error": 0.46,
+        "true_tier": "low",
+        "predicted_tier": "medium",
+        "engagement_rate": 0.2
+      },
+      {
+        "brand": "thumsupofficial",
+        "media_type": "reel",
+        "caption_snippet": "You might think you're ready for it, but we promise you're not. \n\n#AajKuchToofan\u2026",
+        "true_score": 0.962,
+        "predicted_score": 0.501,
+        "absolute_error": 0.46,
+        "true_tier": "high",
+        "predicted_tier": "medium",
+        "engagement_rate": 4.26
+      }
+    ],
+    "analysis": "The largest errors tend to be outlier posts: viral collaborations with celebrity accounts that drove engagement far above the brand's baseline, or posts with unusual creative formats. With only ~35\u2013120 posts per brand, the model lacks enough examples of these extremes. More data (especially edge-case posts) would improve reliability."
+  },
+  "dataset_overview": {
+    "total_posts": 378,
+    "brands": {
+      "cocacola_india": {
+        "n_posts": 120,
+        "median_er": 1.59,
+        "mean_er": 3.93,
+        "tier_distribution": {
+          "high": 41,
+          "medium": 40,
+          "low": 39
+        }
+      },
+      "pepsiindia": {
+        "n_posts": 58,
+        "median_er": 0.13,
+        "mean_er": 3.39,
+        "tier_distribution": {
+          "high": 20,
+          "medium": 20,
+          "low": 18
+        }
+      },
+      "redbullindia": {
+        "n_posts": 119,
+        "median_er": 5.58,
+        "mean_er": 6.08,
+        "tier_distribution": {
+          "medium": 41,
+          "high": 40,
+          "low": 38
+        }
+      },
+      "sprite_india": {
+        "n_posts": 46,
+        "median_er": 1.91,
+        "mean_er": 5.89,
+        "tier_distribution": {
+          "medium": 16,
+          "high": 16,
+          "low": 14
+        }
+      },
+      "thumsupofficial": {
+        "n_posts": 35,
+        "median_er": 3.19,
+        "mean_er": 18.52,
+        "tier_distribution": {
+          "medium": 13,
+          "high": 12,
+          "low": 10
+        }
+      }
+    },
+    "media_types": {
+      "reel": 295,
+      "album": 43,
+      "post": 40
+    },
+    "static_posts_zero_views": 83,
+    "collaborated_posts": 175,
+    "engagement_rate_global": {
+      "min": 0.0007,
+      "max": 157.0937,
+      "mean": 6.1121,
+      "median": 2.2803
+    }
+  }
+}
