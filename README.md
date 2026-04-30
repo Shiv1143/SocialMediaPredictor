@@ -215,7 +215,7 @@ The pre-computed `summary` field on media items (from a vision model) is used di
 
 ---
 
-## Gotchas Discovered and Addressed
+## Potential challenges Discovered and Addressed
 
 A careful audit of the data and model revealed several non-obvious problems:
 

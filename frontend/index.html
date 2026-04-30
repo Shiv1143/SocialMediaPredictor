@@ -295,9 +295,14 @@
 
       <div class="form-group">
         <label for="brand">Brand</label>
-        <select id="brand">
+        <select id="brand" onchange="onBrandChange(this.value)">
           <option value="">Loading brands…</option>
         </select>
+      </div>
+      <div class="form-group" id="custom-brand-group" style="display:none">
+        <label for="custom-brand">Enter Brand Username</label>
+        <input id="custom-brand" type="text" placeholder="e.g. mountain_dew_india" />
+        <div style="font-size:12px;color:var(--muted);margin-top:6px">⚠️ Unknown brands are predicted using cross-brand similarity only. Confidence will be lower.</div>
       </div>
 
       <div class="form-group">
@@ -379,11 +384,25 @@ async function loadBrands() {
     sel.innerHTML = brands.map(b =>
       `<option value="${b}">${b.replace(/_/g,' ').replace(/\b\w/g,c=>c.toUpperCase())}</option>`
     ).join('');
+    sel.innerHTML += `<option value="__other__">Other (enter brand name)</option>`;
   } catch(e) {
     console.error('Could not load brands', e);
   }
 }
 loadBrands();
+
+function onBrandChange(val) {
+  document.getElementById('custom-brand-group').style.display =
+    val === '__other__' ? 'block' : 'none';
+}
+
+function getSelectedBrand() {
+  const sel = document.getElementById('brand').value;
+  if (sel === '__other__') {
+    return document.getElementById('custom-brand').value.trim().toLowerCase().replace(/\s+/g,'_');
+  }
+  return sel;
+}
 
 // ── Image upload UI ──
 document.getElementById('image-file').addEventListener('change', function() {
@@ -399,10 +418,10 @@ document.getElementById('image-file').addEventListener('change', function() {
 async function submitPrediction() {
   const btn = document.getElementById('predict-btn');
   const caption = document.getElementById('caption').value.trim();
-  const brand = document.getElementById('brand').value;
+  const brand = getSelectedBrand();
 
   if (!caption) { alert('Please enter a caption.'); return; }
-  if (!brand)   { alert('Please select a brand.'); return; }
+  if (!brand || brand === '__other__') { alert('Please enter a brand name.'); return; }
 
   btn.disabled = true;
   btn.innerHTML = '<span class="spinner"></span>Predicting…';
@@ -482,6 +501,13 @@ function renderResult(d) {
 
     <div class="summary-text">${exp.summary || ''}</div>
   `;
+
+  // Warnings (e.g. unknown brand)
+  if (d.warnings && d.warnings.length) {
+    d.warnings.forEach(w => {
+      html += `<div style="background:rgba(229,160,74,0.1);border:1px solid rgba(229,160,74,0.3);border-radius:8px;padding:12px;font-size:13px;color:var(--med);margin-bottom:16px">⚠️ ${w}</div>`;
+    });
+  }
 
   // Brand context
   html += `
