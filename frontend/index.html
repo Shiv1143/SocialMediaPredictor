@@ -341,17 +341,16 @@
       </div>
 
       <div class="form-group">
-        <label>Upload Creative Image <span style="color:var(--muted);font-weight:400">(optional)</span></label>
+        <label>Upload Creative <span style="color:var(--muted);font-weight:400">(image or video — visual description auto-generated)</span></label>
         <div class="upload-zone" id="upload-zone">
-          <input type="file" id="image-file" accept="image/*" />
-          <div class="icon">🖼</div>
-          <p id="upload-label">Click or drag to upload an image</p>
+          <input type="file" id="media-file" accept="image/*,video/*" />
+          <div class="icon" id="upload-icon">🎬</div>
+          <p id="upload-label">Click or drag to upload an image or video reel</p>
         </div>
-      </div>
-
-      <div class="form-group">
-        <label for="visual_summary">Visual Description <span style="color:var(--muted);font-weight:400">(or auto-generate from image above)</span></label>
-        <textarea id="visual_summary" rows="3" placeholder="Describe what's in the creative: people, text on screen, brand elements, mood…"></textarea>
+        <div id="media-preview-wrap" style="display:none;margin-top:10px;border-radius:8px;overflow:hidden;max-height:220px;background:var(--surface2)">
+          <img id="img-preview" style="display:none;width:100%;max-height:220px;object-fit:cover" />
+          <video id="vid-preview" style="display:none;width:100%;max-height:220px" controls muted playsinline></video>
+        </div>
       </div>
 
       <button class="btn-predict" id="predict-btn" onclick="submitPrediction()">
@@ -431,13 +430,33 @@ function getSelectedBrand() {
   return sel;
 }
 
-// ── Image upload UI ──
-document.getElementById('image-file').addEventListener('change', function() {
+// ── Media upload UI ──
+document.getElementById('media-file').addEventListener('change', function() {
   const zone = document.getElementById('upload-zone');
   const label = document.getElementById('upload-label');
+  const previewWrap = document.getElementById('media-preview-wrap');
+  const imgPreview = document.getElementById('img-preview');
+  const vidPreview = document.getElementById('vid-preview');
+  const icon = document.getElementById('upload-icon');
+
   if (this.files && this.files[0]) {
+    const file = this.files[0];
     zone.classList.add('has-file');
-    label.textContent = `✓ ${this.files[0].name}`;
+    label.textContent = `✓ ${file.name}`;
+    previewWrap.style.display = 'block';
+
+    const url = URL.createObjectURL(file);
+    if (file.type.startsWith('video/')) {
+      icon.textContent = '🎬';
+      imgPreview.style.display = 'none';
+      vidPreview.src = url;
+      vidPreview.style.display = 'block';
+    } else {
+      icon.textContent = '🖼';
+      vidPreview.style.display = 'none';
+      imgPreview.src = url;
+      imgPreview.style.display = 'block';
+    }
   }
 });
 
@@ -451,7 +470,8 @@ async function submitPrediction() {
   if (!brand || brand === '__other__') { alert('Please enter a brand name.'); return; }
 
   btn.disabled = true;
-  btn.innerHTML = '<span class="spinner"></span>Predicting…';
+  const hasMedia = document.getElementById('media-file').files[0];
+  btn.innerHTML = `<span class="spinner"></span>${hasMedia ? 'Analyzing creative & predicting…' : 'Predicting…'}`;
 
   const form = new FormData();
   form.append('caption', caption);
@@ -474,11 +494,8 @@ async function submitPrediction() {
   const postedAt = document.getElementById('posted_at').value;
   if (postedAt) form.append('posted_at', new Date(postedAt).toISOString());
 
-  const vs = document.getElementById('visual_summary').value.trim();
-  if (vs) form.append('visual_summary', vs);
-
-  const imgFile = document.getElementById('image-file').files[0];
-  if (imgFile) form.append('image', imgFile);
+  const mediaFile = document.getElementById('media-file').files[0];
+  if (mediaFile) form.append('media_file', mediaFile);
 
   try {
     const res = await fetch(`${API}/api/predict/upload`, { method: 'POST', body: form });
@@ -588,6 +605,16 @@ function renderResult(d) {
         </div>
       `;
     });
+  }
+
+  // Auto-generated visual description
+  if (d.visual_summary_used) {
+    html += `
+      <div class="section-label">Auto-Generated Visual Description</div>
+      <div style="font-size:13px;color:var(--muted);background:var(--surface2);border-radius:8px;padding:12px;line-height:1.6;font-style:italic">
+        "${d.visual_summary_used}"
+      </div>
+    `;
   }
 
   // Model internals

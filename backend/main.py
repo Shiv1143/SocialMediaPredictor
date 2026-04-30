@@ -233,8 +233,7 @@ async def predict_upload(
     collaborators: str = Form(""),
     collaborator_follower_count: Optional[int] = Form(None),
     posted_at: Optional[str] = Form(None),
-    visual_summary: Optional[str] = Form(None),
-    image: Optional[UploadFile] = File(None),
+    media_file: Optional[UploadFile] = File(None),
 ):
     """
     Same as `/api/predict` but accepts `multipart/form-data` so the frontend
@@ -244,10 +243,10 @@ async def predict_upload(
     """
     p = _get_predictor()
 
-    img_summary = visual_summary or ""
-    if image and not img_summary:
+    img_summary = ""
+    if media_file:
         try:
-            img_summary = await _vision_summary(image)
+            img_summary = await _vision_summary(media_file)
         except Exception as exc:
             logger.warning("Vision summary failed: %s", exc)
             img_summary = ""
@@ -324,40 +323,158 @@ def _build_post_dict(req: PredictRequest) -> dict:
     }
 
 
-async def _vision_summary(image: UploadFile) -> str:
-    """Call OpenAI GPT-4o-mini Vision to describe the uploaded creative."""
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
+_VISION_PROMPT = (
+    "Analyze this Instagram creative briefly for an engagement prediction system. "
+    "Describe: 1) what's shown (people, objects, setting), "
+    "2) any text overlays or captions visible on screen, "
+    "3) brand elements or logos, "
+    "4) overall mood and energy. "
+    "Keep it under 120 words."
+)
+
+
+async def _vision_summary(media: UploadFile) -> str:
+    """
+    Auto-generate a visual summary from an uploaded image or video file.
+
+    Priority:
+      1. Ollama vision model (llava) — local, free, works for both image and video frames
+      2. OpenAI GPT-4o-mini Vision — if OPENAI_API_KEY is set (images only)
+      3. Empty string — graceful fallback when neither is available
+    """
+    contents = await media.read()
+    content_type = media.content_type or ""
+    is_video = content_type.startswith("video/") or media.filename.lower().rsplit(".", 1)[-1] in (
+        "mp4", "mov", "avi", "webm", "mkv"
+    )
+
+    # Extract frames: for video pull 3 keyframes; for image use the file directly
+    if is_video:
+        frames = _extract_video_frames(contents)
+        frame_mime = "image/jpeg"
+    else:
+        frames = [contents]
+        frame_mime = content_type or "image/jpeg"
+
+    if not frames:
         return ""
 
-    from openai import AsyncOpenAI
+    # Try Ollama vision first
+    summary = await _ollama_vision(frames, is_video)
+    if summary:
+        return summary
 
-    contents = await image.read()
-    b64 = base64.b64encode(contents).decode()
-    mime = image.content_type or "image/jpeg"
+    # Fallback: OpenAI vision (images only — OpenAI doesn't accept video frames from non-URL)
+    if not is_video:
+        api_key = os.getenv("OPENAI_API_KEY")
+        if api_key:
+            summary = await _openai_vision(frames[0], frame_mime, api_key)
+            if summary:
+                return summary
 
-    client = AsyncOpenAI(api_key=api_key)
-    resp = await client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {
+    return ""
+
+
+def _extract_video_frames(video_bytes: bytes, n_frames: int = 3) -> list:
+    """
+    Extract n evenly-spaced keyframes from a video as JPEG bytes.
+    Returns an empty list if cv2 is not installed or the video can't be decoded.
+    """
+    try:
+        import cv2
+        import numpy as np
+        import tempfile, os as _os
+
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
+            f.write(video_bytes)
+            tmp_path = f.name
+
+        try:
+            cap = cv2.VideoCapture(tmp_path)
+            total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            if total == 0:
+                cap.release()
+                return []
+
+            frames = []
+            for i in range(n_frames):
+                # Sample at 20%, 50%, 80% through the video
+                pos = int(total * (i + 1) / (n_frames + 1))
+                cap.set(cv2.CAP_PROP_POS_FRAMES, pos)
+                ret, frame = cap.read()
+                if ret:
+                    _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
+                    frames.append(bytes(buf))
+            cap.release()
+            return frames
+        finally:
+            _os.unlink(tmp_path)
+
+    except ImportError:
+        logger.warning("opencv-python-headless not installed — cannot extract video frames")
+        return []
+    except Exception as e:
+        logger.warning("Video frame extraction failed: %s", e)
+        return []
+
+
+async def _ollama_vision(frames: list, is_video: bool) -> str:
+    """Describe frames using the Ollama vision model (llava or similar)."""
+    host = os.getenv("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
+    model = os.getenv("OLLAMA_VISION_MODEL", "llava")
+
+    descriptions = []
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        for i, frame_bytes in enumerate(frames):
+            b64 = base64.b64encode(frame_bytes).decode()
+            prompt = (
+                f"[Frame {i+1}/{len(frames)} of a video reel] {_VISION_PROMPT}"
+                if is_video and len(frames) > 1
+                else _VISION_PROMPT
+            )
+            try:
+                resp = await client.post(
+                    f"{host}/api/generate",
+                    json={
+                        "model": model,
+                        "prompt": prompt,
+                        "images": [b64],
+                        "stream": False,
+                        "options": {"num_predict": 150, "temperature": 0.2},
+                    },
+                )
+                resp.raise_for_status()
+                descriptions.append(resp.json()["response"].strip())
+            except Exception as e:
+                logger.debug("Ollama vision frame %d failed: %s", i + 1, e)
+                return ""  # If Ollama is not up, bail immediately
+
+    if not descriptions:
+        return ""
+    if len(descriptions) == 1:
+        return descriptions[0]
+    # Merge multi-frame descriptions into one video summary
+    return " | ".join(f"[{i+1}] {d}" for i, d in enumerate(descriptions))
+
+
+async def _openai_vision(image_bytes: bytes, mime: str, api_key: str) -> str:
+    """Describe a single image using OpenAI GPT-4o-mini Vision (fallback)."""
+    try:
+        from openai import AsyncOpenAI
+        b64 = base64.b64encode(image_bytes).decode()
+        client = AsyncOpenAI(api_key=api_key)
+        resp = await client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{
                 "role": "user",
                 "content": [
-                    {
-                        "type": "text",
-                        "text": (
-                            "Analyze this Instagram post image briefly. Provide: "
-                            "1) Summary 2) Any visible text 3) Visual entities "
-                            "4) Brand logos if visible. Keep it under 200 words."
-                        ),
-                    },
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:{mime};base64,{b64}"},
-                    },
+                    {"type": "text", "text": _VISION_PROMPT},
+                    {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
                 ],
-            }
-        ],
-        max_tokens=250,
-    )
-    return resp.choices[0].message.content or ""
+            }],
+            max_tokens=200,
+        )
+        return resp.choices[0].message.content or ""
+    except Exception as e:
+        logger.warning("OpenAI vision fallback failed: %s", e)
+        return ""
