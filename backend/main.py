@@ -12,6 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from backend.config import BASE_DIR, MODELS_DIR
+from backend.llm.explainer import generate_explanation
 from backend.models.predictor import HybridPredictor
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -131,13 +132,31 @@ async def get_evaluation():
 class PredictRequest(BaseModel):
     caption: str
     brand: str
-    media_type: str = "reel"         # reel | post | album
-    duration: Optional[int] = None   # seconds (reels only)
+    media_type: str = "reel"                         # reel | post | album
+    duration: Optional[int] = None                   # seconds (reels only)
     is_collaborated: bool = False
     collaborators: Optional[List[str]] = []
-    posted_at: Optional[str] = None  # ISO-8601 datetime string
+    collaborator_follower_count: Optional[int] = None  # used for tier-based score boost
+    posted_at: Optional[str] = None                  # ISO-8601 datetime string
     visual_summary: Optional[str] = None
-    followers: Optional[int] = None  # override brand default
+    followers: Optional[int] = None                  # override brand default
+
+
+class SeedPost(BaseModel):
+    caption: str
+    engagement_rate: float
+    media_type: str = "reel"
+    duration: Optional[int] = None
+    is_collaborated: bool = False
+    collaborators: Optional[List[str]] = []
+    created_at: Optional[str] = None
+    visual_summary: Optional[str] = None
+
+
+class RegisterBrandRequest(BaseModel):
+    brand: str
+    followers: int
+    seed_posts: List[SeedPost]
 
 
 @app.post("/api/predict", tags=["prediction"])
@@ -151,6 +170,7 @@ async def predict_json(request: PredictRequest):
     - **duration**: Video length in seconds (reels only)
     - **is_collaborated**: Whether the post is a collab
     - **collaborators**: List of collaborator usernames
+    - **collaborator_follower_count**: Follower count of the main collaborator (enables tier-based score boost)
     - **posted_at**: Planned publish time (ISO-8601); affects time-of-day features
     - **visual_summary**: Text description of the creative (from a vision model or manual)
     - **followers**: Override the brand's default follower count
@@ -158,9 +178,44 @@ async def predict_json(request: PredictRequest):
     p = _get_predictor()
     post = _build_post_dict(request)
     try:
-        return p.predict(post)
+        result = p.predict(post)
+        result = await _enrich_explanation(post, result, p)
+        return result
     except Exception as exc:
         logger.exception("Prediction error")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/brands/register", tags=["brands"])
+async def register_brand(request: RegisterBrandRequest):
+    """
+    Register a new brand (cold-start) or add seed posts to an existing one.
+
+    Provide at least 10 real posts with their actual engagement rates to get
+    meaningful within-brand predictions. With fewer posts, cross-brand similarity
+    dominates and accuracy is lower.
+
+    After registration, the model is saved to disk automatically.
+    """
+    p = _get_predictor()
+    if len(request.seed_posts) < 3:
+        raise HTTPException(
+            status_code=422,
+            detail="At least 3 seed posts are required. Provide 10+ for best results.",
+        )
+    try:
+        seed_dicts = [sp.model_dump() for sp in request.seed_posts]
+        result = p.add_brand(request.brand, request.followers, seed_dicts)
+        return {
+            "status": "registered",
+            **result,
+            "message": (
+                f"Brand '{request.brand}' registered with {len(request.seed_posts)} posts. "
+                "Predictions for this brand will now use within-brand similarity."
+            ),
+        }
+    except Exception as exc:
+        logger.exception("Brand registration error")
         raise HTTPException(status_code=500, detail=str(exc))
 
 
@@ -176,6 +231,7 @@ async def predict_upload(
     duration: Optional[int] = Form(None),
     is_collaborated: bool = Form(False),
     collaborators: str = Form(""),
+    collaborator_follower_count: Optional[int] = Form(None),
     posted_at: Optional[str] = Form(None),
     visual_summary: Optional[str] = Form(None),
     image: Optional[UploadFile] = File(None),
@@ -206,6 +262,7 @@ async def predict_upload(
         "is_collaborated": is_collaborated or bool(collab_list),
         "collaborators": collab_list,
         "num_collaborators": len(collab_list),
+        "collaborator_follower_count": collaborator_follower_count,
         "created_at": posted_at,
         "visual_summary": img_summary,
         "followers": p.brand_stats.get(brand, {}).get("median_followers", 100_000),
@@ -213,7 +270,7 @@ async def predict_upload(
 
     try:
         result = p.predict(post)
-        # Attach the generated visual summary so the frontend can display it
+        result = await _enrich_explanation(post, result, p)
         result["visual_summary_used"] = img_summary
         return result
     except Exception as exc:
@@ -224,6 +281,30 @@ async def predict_upload(
 # ------------------------------------------------------------------
 # Internal helpers
 # ------------------------------------------------------------------
+
+async def _enrich_explanation(post: dict, result: dict, p: HybridPredictor) -> dict:
+    """
+    Replace the template explanation summary with an LLM-generated one when
+    OPENAI_API_KEY is set. Falls back gracefully; never blocks the prediction.
+    """
+    try:
+        exp = result.get("explanation", {})
+        brand = post.get("brand", "unknown")
+        brand_stats = p.brand_stats.get(brand) or p.brand_stats.get("_global", {})
+        alignment = result.get("model_details", {}).get("brand_alignment_score")
+        llm_summary = await generate_explanation(
+            post=post,
+            prediction=result,
+            similar_posts=exp.get("similar_posts", []),
+            key_factors=exp.get("key_factors", []),
+            brand_stats=brand_stats,
+            brand_alignment_score=alignment,
+        )
+        result["explanation"]["summary"] = llm_summary
+    except Exception as e:
+        logger.warning("Explanation enrichment failed: %s", e)
+    return result
+
 
 def _build_post_dict(req: PredictRequest) -> dict:
     p = _get_predictor()
@@ -236,6 +317,7 @@ def _build_post_dict(req: PredictRequest) -> dict:
         "is_collaborated": req.is_collaborated or bool(collab_list),
         "collaborators": collab_list,
         "num_collaborators": len(collab_list),
+        "collaborator_follower_count": req.collaborator_follower_count,
         "created_at": req.posted_at,
         "visual_summary": req.visual_summary or "",
         "followers": req.followers or p.brand_stats.get(req.brand, {}).get("median_followers", 100_000),

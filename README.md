@@ -32,11 +32,12 @@ The `train.py` script trains the model, runs full evaluation, and saves both the
 ## Architecture
 
 ```
-POST /api/predict/upload  (multipart — with optional image upload)
-POST /api/predict         (JSON body)
-GET  /brands              → list of known brands
-GET  /api/dataset/stats   → per-brand engagement statistics
-GET  /api/evaluation      → pre-computed evaluation results
+POST /api/predict/upload    (multipart — with optional image upload)
+POST /api/predict           (JSON body)
+POST /brands/register       (register a new brand with seed posts — cold start)
+GET  /brands                → list of known brands
+GET  /api/dataset/stats     → per-brand engagement statistics
+GET  /api/evaluation        → pre-computed evaluation results
 ```
 
 ### System Diagram
@@ -53,11 +54,14 @@ User Input
   └──────────┬──────────────┬────────────┘
              │              │
              ▼              ▼
-  ┌──────────────┐  ┌──────────────────────┐
-  │    Ridge     │  │  Sentence-Transformer │
-  │  Regression  │  │    (all-MiniLM-L6-v2) │
-  │  (α = 1.0)   │  │    + Cosine KNN K=7   │
-  └──────┬───────┘  └──────────┬───────────┘
+  ┌──────────────┐  ┌──────────────────────┐  ┌────────────────────┐
+  │    Ridge     │  │  Sentence-Transformer │  │  Collaborator Tier │
+  │  Regression  │  │    (all-MiniLM-L6-v2) │  │  Score Adjustment  │
+  │  (α = 1.0)   │  │  + Brand-aware KNN    │  │  (+0–0.15 boost)   │
+  └──────┬───────┘  └──────────┬───────────┘  └────────┬───────────┘
+                                                         │
+  ┌──────┴──────────────────────┘               off-strategy detection
+  │   35% Ridge + 65% KNN                       (brand centroid cosine sim)
          │ weight 0.35         │ weight 0.65
          └──────────┬──────────┘
                     ▼
@@ -178,16 +182,28 @@ With 10× more data, we'd have more examples of these extremes and the embedding
 
 ## Feature Engineering
 
-22 structured features extracted from each post:
+26 structured features extracted from each post:
 
 | Category   | Features |
 |------------|----------|
-| Media type | `is_reel`, `is_post`, `is_album` |
+| Media type | `is_reel`, `is_post`, `is_album`, `is_static` (views=0 flag) |
 | Duration   | `duration_seconds`, `duration_short` (≤15s), `duration_medium` (15–60s), `duration_long` (>60s) |
-| Collab     | `is_collaborated`, `num_collaborators` |
-| Timing     | `post_hour`, `post_day_of_week`, `post_month`, `is_weekend` |
+| Collab     | `is_collaborated`, `num_collaborators`, `is_reel_collab` (reel×collab interaction) |
+| Timing     | `post_hour_ist`, `post_day_of_week`, `post_month`, `is_weekend`, `is_prime_time` (17–22 IST) |
 | Audience   | `followers_log`, `followers_bucket` (tier 0–3) |
 | Caption    | `caption_word_count`, `caption_char_count`, `emoji_count`, `hashtag_count`, `mention_count`, `has_question`, `has_exclamation` |
+
+**Collaborator tier** (post-hoc score adjustment, not a Ridge feature): When `collaborator_follower_count` is supplied, a score boost is applied based on expected audience amplification:
+
+| Collaborator tier | Follower range | Score boost |
+|-------------------|---------------|-------------|
+| Mega celebrity    | 5M+           | +0.15       |
+| Macro influencer  | 1M–5M         | +0.08       |
+| Mid-tier creator  | 100K–1M       | +0.03       |
+| Micro-influencer  | <100K         | 0.00        |
+| Unknown           | not provided  | 0.00        |
+
+Boost is conservative (the training data shows that generic collaborations actually show 0.8× ER lift on average — it's the high-profile celebrity collabs that drive outsized results).
 
 For embeddings, the following text is encoded:
 ```
@@ -302,12 +318,14 @@ A careful audit of the data and model revealed several non-obvious problems:
 assignment/
 ├── backend/
 │   ├── config.py               # Paths and constants
-│   ├── main.py                 # FastAPI application
+│   ├── main.py                 # FastAPI application + brand registration endpoint
 │   ├── data/
 │   │   ├── loader.py           # Dataset parsing → DataFrame
-│   │   └── features.py         # Feature extraction (22 structured features)
+│   │   └── features.py         # Feature extraction (26 structured features)
 │   ├── models/
-│   │   └── predictor.py        # HybridPredictor (Ridge + KNN)
+│   │   └── predictor.py        # HybridPredictor (Ridge + KNN + brand centroids)
+│   ├── llm/
+│   │   └── explainer.py        # LLM explanation layer (GPT-4o-mini, falls back to template)
 │   └── evaluation/
 │       └── evaluator.py        # LOBO CV, baselines, failure analysis
 ├── frontend/
@@ -366,10 +384,43 @@ assignment/
 
 Same fields as above but as `multipart/form-data`. Accepts an optional `image` file. If `OPENAI_API_KEY` is set, the image is described via GPT-4o-mini Vision and the description is used for embedding.
 
+Additional fields:
+- `collaborator_follower_count` (int, optional): Enables collaborator tier score adjustment (+0.03 to +0.15)
+
+### `POST /brands/register`
+
+Register a new brand (cold-start onboarding) or add seed posts to an existing brand. After registration, all subsequent predictions for this brand will use within-brand KNN.
+
+```json
+{
+  "brand": "mountain_dew_india",
+  "followers": 1500000,
+  "seed_posts": [
+    {
+      "caption": "Do the Dew! Extreme stunts with Hrithik Roshan 🏄",
+      "engagement_rate": 3.8,
+      "media_type": "reel",
+      "duration": 45,
+      "is_collaborated": true
+    },
+    {
+      "caption": "Mountaineer. Explorer. Dew drinker.",
+      "engagement_rate": 1.2,
+      "media_type": "post"
+    }
+  ]
+}
+```
+
+> **Minimum 3 seed posts required**. Provide 10+ for best results.
+
 ---
 
 ## Environment Variables (optional)
 
 ```env
-OPENAI_API_KEY=sk-...   # Enables image→visual summary via GPT-4o-mini
+OPENAI_API_KEY=sk-...   # Enables: (1) image→visual summary via GPT-4o-mini Vision,
+                         #           (2) LLM explanation generation via GPT-4o-mini text
 ```
+
+When `OPENAI_API_KEY` is set, the `explanation.summary` field is replaced with a GPT-4o-mini generated paragraph that a content manager can act on directly. Without the key, a structured template explanation is used (still informative, just less fluent).

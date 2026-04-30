@@ -62,6 +62,10 @@ class HybridPredictor:
         # Per-brand engagement statistics for denormalization and context
         self.brand_stats: dict = {}
 
+        # Brand centroid embeddings for off-strategy detection (Item 4)
+        # brand → mean embedding of all training posts for that brand
+        self.brand_centroids: dict = {}
+
         self.is_trained = False
 
     # ------------------------------------------------------------------
@@ -96,6 +100,9 @@ class HybridPredictor:
         # 3. Store records + targets for KNN lookup
         self.train_records = df.to_dict("records")
         self.train_targets = y
+
+        # 4. Compute per-brand centroid embeddings for off-strategy detection
+        self._compute_brand_centroids(df, self.train_embeddings)
 
         self.is_trained = True
         logger.info(f"Training complete. Ridge R² (in-sample): {ridge_train_r2:.3f}")
@@ -197,7 +204,7 @@ class HybridPredictor:
             top_k_sims = cross_k_sims
 
         # ---------- Hybrid ----------
-        final_score = float(
+        base_score = float(
             np.clip(
                 self.ridge_weight * ridge_score + self.knn_weight * knn_score,
                 0.0,
@@ -205,18 +212,45 @@ class HybridPredictor:
             )
         )
 
+        # ---------- Collaborator tier adjustment (Item 1) ----------
+        # The training data doesn't have collaborator follower counts, so this
+        # can't be a Ridge feature. Instead we apply a data-informed post-hoc
+        # adjustment based on the expected audience amplification from the
+        # collaborator's reach tier. Adjustments are conservative: generic
+        # collaborations actually show 0.8x lift in our training data; the
+        # positive adjustment only applies when the collaborator is verifiably
+        # large (mid-tier or above).
+        collaborator_tier = _resolve_collaborator_tier(post)
+        tier_adjustments = {0: 0.0, 1: 0.0, 2: 0.03, 3: 0.08, 4: 0.15}
+        collab_adjustment = tier_adjustments.get(collaborator_tier, 0.0)
+        final_score = float(np.clip(base_score + collab_adjustment, 0.0, 1.0))
+
+        # ---------- Off-strategy detection (Item 4) ----------
+        brand_alignment_score = None
+        is_off_strategy = False
+        if brand in self.brand_centroids:
+            centroid = self.brand_centroids[brand]
+            brand_alignment_score = float(np.dot(query_emb, centroid))
+            is_off_strategy = brand_alignment_score < 0.30
+
         tier = _score_to_tier(final_score)
         estimated_er = self._denormalize_er(final_score, brand, content_group)
         confidence = self._confidence(top_k_sims, ridge_score, knn_score)
 
-        # Reduce confidence for unknown brands — predictions are less reliable
+        # Reduce confidence for unknown brands
         if not known_brand:
             confidence *= 0.6
+        # Reduce confidence for off-strategy posts — less historical data to compare against
+        if is_off_strategy:
+            confidence *= 0.8
 
         explanation = self._explain(
             post, features, sims, top_k_idx, top_k_sims,
             ridge_score, knn_score, final_score, brand,
             content_group=content_group,
+            brand_alignment_score=brand_alignment_score,
+            collaborator_tier=collaborator_tier,
+            collab_adjustment=collab_adjustment,
         )
 
         warnings = []
@@ -224,13 +258,19 @@ class HybridPredictor:
             warnings.append(
                 f"Brand '{brand}' was not seen during training. "
                 "Prediction uses cross-brand similarity only and should be treated "
-                "as a rough estimate. Add training data for this brand for better accuracy."
+                "as a rough estimate. Use POST /brands/register to add training data."
             )
         if content_group == "static":
             warnings.append(
-                "Static posts (images/albums) use a followers-based engagement rate. "
-                "This is a different metric than reel ER (views-based) and cannot be "
-                "directly compared."
+                "Static posts (images/albums) use a followers-based engagement rate "
+                "(ER = interactions/followers). This differs from reel ER (interactions/views) "
+                "and cannot be directly compared."
+            )
+        if is_off_strategy:
+            warnings.append(
+                f"This post's content is atypical for {brand}'s usual style "
+                f"(brand alignment score: {brand_alignment_score:.2f}). "
+                "Prediction uncertainty is higher — the model has fewer similar examples to reference."
             )
 
         result = {
@@ -242,10 +282,14 @@ class HybridPredictor:
             "model_details": {
                 "ridge_score": round(ridge_score, 4),
                 "knn_score": round(knn_score, 4),
+                "base_score": round(base_score, 4),
+                "collab_tier_adjustment": round(collab_adjustment, 4),
+                "collaborator_tier": collaborator_tier,
                 "ridge_weight": self.ridge_weight,
                 "knn_weight": self.knn_weight,
                 "content_group": content_group,
                 "known_brand": known_brand,
+                "brand_alignment_score": round(brand_alignment_score, 3) if brand_alignment_score is not None else None,
             },
         }
         if warnings:
@@ -291,6 +335,9 @@ class HybridPredictor:
         self, post, features, all_sims, top_k_idx, top_k_sims,
         ridge_score, knn_score, final_score, brand,
         content_group: str = "reel",
+        brand_alignment_score: Optional[float] = None,
+        collaborator_tier: int = 0,
+        collab_adjustment: float = 0.0,
     ) -> dict:
         """Build the explanation dict returned to the caller."""
 
@@ -341,16 +388,28 @@ class HybridPredictor:
 
         tier = _score_to_tier(final_score)
         tier_label = {"low": "below average", "medium": "average", "high": "above average"}[tier]
-        summary = (
+        summary_parts = [
             f"This post is predicted to perform {tier_label} for {brand.replace('_', ' ')}. "
             f"Estimated engagement rate: {estimated_er:.2f}% "
             f"(brand median: {brand_median:.2f}%). "
             f"Prediction driven {int(self.knn_weight * 100)}% by content similarity "
             f"and {int(self.ridge_weight * 100)}% by structural features."
-        )
+        ]
+        if collab_adjustment > 0:
+            tier_labels = {1: "micro-influencer", 2: "mid-tier creator",
+                           3: "macro influencer", 4: "mega celebrity"}
+            summary_parts.append(
+                f" Score boosted by +{collab_adjustment:.2f} for "
+                f"{tier_labels.get(collaborator_tier, 'collaborator')} partnership."
+            )
+        if brand_alignment_score is not None and brand_alignment_score < 0.30:
+            summary_parts.append(
+                f" Note: This content is atypical for this brand "
+                f"(alignment {brand_alignment_score:.2f}); confidence is reduced."
+            )
 
         return {
-            "summary": summary,
+            "summary": "".join(summary_parts),
             "key_factors": top_factors,
             "similar_posts": similar_posts,
             "brand_context": {
@@ -358,7 +417,101 @@ class HybridPredictor:
                 "brand_median_er": round(brand_median, 2),
                 "estimated_er": round(estimated_er, 2),
                 "performance_tier": tier,
+                "brand_alignment_score": round(brand_alignment_score, 3) if brand_alignment_score is not None else None,
             },
+        }
+
+    def _compute_brand_centroids(self, df: pd.DataFrame, embeddings: np.ndarray):
+        """
+        Compute per-brand centroid embeddings for off-strategy detection.
+
+        The centroid is the L2-normalised mean of all training embeddings for that
+        brand. At inference time, cosine similarity of the query embedding to its
+        brand centroid gives a 'brand alignment score' (0–1). Posts scoring < 0.30
+        are flagged as atypical — the model has less experience with this style of
+        content and uncertainty is higher.
+        """
+        self.brand_centroids = {}
+        brands = [r.get("brand") for r in self.train_records]
+        for brand in set(brands):
+            idxs = [i for i, b in enumerate(brands) if b == brand]
+            if not idxs:
+                continue
+            centroid = embeddings[idxs].mean(axis=0)
+            norm = np.linalg.norm(centroid)
+            if norm > 1e-9:
+                centroid /= norm
+            self.brand_centroids[brand] = centroid
+
+    def add_brand(self, brand_name: str, followers: int, seed_posts: list) -> dict:
+        """
+        Register a new (or update an existing) brand by supplying seed posts.
+
+        Each seed post must have:
+          - caption (str)
+          - engagement_rate (float) — required for building brand stats
+          - media_type (str, default 'reel')
+          - is_collaborated (bool, optional)
+          - duration (int, optional)
+          - created_at (str ISO, optional)
+          - visual_summary (str, optional)
+
+        Adds posts to the KNN corpus, recomputes brand stats and centroids,
+        and saves the updated model.  Returns a summary of what was added.
+        """
+        if not self.is_trained:
+            raise RuntimeError("Model must be trained before adding a brand.")
+
+        # Normalise and encode seed posts
+        new_records = []
+        new_texts = []
+        new_targets = []
+        for raw in seed_posts:
+            rec = dict(raw)
+            rec["brand"] = brand_name
+            rec.setdefault("followers", followers)
+            rec.setdefault("media_type", "reel")
+            mt = rec["media_type"].lower()
+            rec["is_static"] = int(mt in ("post", "album"))
+            rec["content_group"] = "reel" if mt == "reel" else "static"
+            rec["views"] = 0 if rec["is_static"] else followers  # rough estimate
+            rec["performance_tier"] = "medium"  # placeholder; overwritten below
+            new_records.append(rec)
+            new_texts.append(build_text_for_embedding(rec))
+
+        new_embs = self.embedding_model.encode(
+            new_texts, normalize_embeddings=True, batch_size=32, show_progress_bar=False
+        )
+
+        # Build brand_norm_score for the seed posts (percentile within seed set)
+        er_vals = np.array([r.get("engagement_rate", 0.0) for r in new_records])
+        if len(er_vals) > 1:
+            ranks = pd.Series(er_vals).rank(pct=True, method="average").values
+        else:
+            ranks = np.array([0.5])
+        for rec, score, rank in zip(new_records, er_vals, ranks):
+            rec["brand_norm_score"] = float(rank)
+            tier = _score_to_tier(float(rank))
+            rec["performance_tier"] = tier
+        new_targets = ranks
+
+        # Append to corpus
+        self.train_embeddings = np.vstack([self.train_embeddings, new_embs])
+        self.train_records = self.train_records + new_records
+        self.train_targets = np.concatenate([self.train_targets, new_targets])
+
+        # Rebuild brand stats for this brand
+        seed_df = pd.DataFrame(new_records)
+        all_df = pd.DataFrame(self.train_records)
+        self._compute_brand_stats(all_df)
+        self._compute_brand_centroids(all_df, self.train_embeddings)
+
+        self.save()
+        logger.info(f"Brand '{brand_name}' registered with {len(seed_posts)} seed posts.")
+        return {
+            "brand": brand_name,
+            "seed_posts_added": len(seed_posts),
+            "corpus_size": len(self.train_records),
         }
 
     def _compute_brand_stats(self, df: pd.DataFrame):
@@ -428,6 +581,40 @@ class HybridPredictor:
 # ------------------------------------------------------------------
 # Module-level helpers
 # ------------------------------------------------------------------
+
+def _resolve_collaborator_tier(post: dict) -> int:
+    """
+    Determine collaborator tier (0–4) from available post metadata.
+
+    Priority order:
+      1. Explicit `collaborator_tier` key (already computed upstream)
+      2. `collaborator_follower_count` (convert using standard tier thresholds)
+      3. Default: 0 (unknown)
+
+    Tier mapping:
+      0 = unknown / not collaborated
+      1 = nano/micro  (< 100K followers)
+      2 = mid-tier    (100K – 1M)
+      3 = macro       (1M – 5M)
+      4 = mega        (> 5M)
+    """
+    if not post.get("is_collaborated", False):
+        return 0
+    explicit = post.get("collaborator_tier")
+    if explicit is not None:
+        return int(explicit)
+    fc = post.get("collaborator_follower_count")
+    if fc is None:
+        return 0  # collaborated but tier unknown → no adjustment (conservative)
+    fc = int(fc)
+    if fc >= 5_000_000:
+        return 4
+    if fc >= 1_000_000:
+        return 3
+    if fc >= 100_000:
+        return 2
+    return 1
+
 
 def _score_to_tier(score: float) -> str:
     if score <= 0.33:

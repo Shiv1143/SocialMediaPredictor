@@ -326,8 +326,13 @@
       </div>
 
       <div class="form-group">
-        <label for="collaborators">Collaborators <span style="color:var(--muted);font-weight:400">(comma-separated)</span></label>
-        <input id="collaborators" type="text" placeholder="e.g. virat.kohli, hardikpandya7" />
+        <label for="collaborators">Collaborators <span style="color:var(--muted);font-weight:400">(comma-separated usernames)</span></label>
+        <input id="collaborators" type="text" placeholder="e.g. virat.kohli, hardikpandya7" oninput="onCollabChange()" />
+      </div>
+      <div class="form-group" id="collab-tier-group" style="display:none">
+        <label for="collaborator_follower_count">Main Collaborator's Follower Count <span style="color:var(--muted);font-weight:400">(optional — improves prediction)</span></label>
+        <input id="collaborator_follower_count" type="number" min="0" placeholder="e.g. 50000000 for Virat Kohli" />
+        <div id="collab-tier-label" style="font-size:12px;color:var(--accent2);margin-top:6px"></div>
       </div>
 
       <div class="form-group">
@@ -396,6 +401,28 @@ function onBrandChange(val) {
     val === '__other__' ? 'block' : 'none';
 }
 
+function onCollabChange() {
+  const collab = document.getElementById('collaborators').value.trim();
+  const group = document.getElementById('collab-tier-group');
+  group.style.display = collab ? 'block' : 'none';
+}
+
+function getCollabTierLabel(fc) {
+  if (!fc) return '';
+  fc = parseInt(fc);
+  if (fc >= 5_000_000) return '⭐ Mega celebrity (5M+ followers) — +0.15 score boost';
+  if (fc >= 1_000_000) return '🌟 Macro influencer (1M–5M followers) — +0.08 score boost';
+  if (fc >= 100_000)   return '✨ Mid-tier creator (100K–1M followers) — +0.03 score boost';
+  if (fc >= 1_000)     return '👤 Micro-influencer (<100K followers) — no adjustment';
+  return '👤 Nano influencer — no adjustment';
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  document.getElementById('collaborator_follower_count').addEventListener('input', function() {
+    document.getElementById('collab-tier-label').textContent = getCollabTierLabel(this.value);
+  });
+});
+
 function getSelectedBrand() {
   const sel = document.getElementById('brand').value;
   if (sel === '__other__') {
@@ -438,6 +465,8 @@ async function submitPrediction() {
   if (collab) {
     form.append('collaborators', collab);
     form.append('is_collaborated', 'true');
+    const collabFC = document.getElementById('collaborator_follower_count').value;
+    if (collabFC) form.append('collaborator_follower_count', collabFC);
   } else {
     form.append('is_collaborated', 'false');
   }
@@ -561,14 +590,21 @@ function renderResult(d) {
     });
   }
 
-  // Model internals (collapsed by default)
+  // Model internals
+  const collabTierLabels = {0:'unknown',1:'micro',2:'mid-tier',3:'macro',4:'mega'};
+  const alignScore = md.brand_alignment_score;
+  const alignLabel = alignScore != null
+    ? `${(alignScore*100).toFixed(0)}% ${alignScore < 0.30 ? '⚠️ atypical' : '✓ on-brand'}`
+    : 'N/A';
   html += `
     <div class="section-label">Model Internals</div>
     <div style="font-size:12px;color:var(--muted);background:var(--surface2);border-radius:8px;padding:12px;display:grid;grid-template-columns:1fr 1fr;gap:8px">
       <div>Ridge score: <b style="color:var(--text)">${md.ridge_score}</b></div>
       <div>KNN score: <b style="color:var(--text)">${md.knn_score}</b></div>
-      <div>Ridge weight: <b style="color:var(--text)">${md.ridge_weight}</b></div>
-      <div>KNN weight: <b style="color:var(--text)">${md.knn_weight}</b></div>
+      <div>Collab tier: <b style="color:var(--text)">${collabTierLabels[md.collaborator_tier] || '—'}</b></div>
+      <div>Tier boost: <b style="color:var(--accent2)">${md.collab_tier_adjustment > 0 ? '+'+md.collab_tier_adjustment : '—'}</b></div>
+      <div>Brand alignment: <b style="color:var(--text)">${alignLabel}</b></div>
+      <div>Known brand: <b style="color:var(--text)">${md.known_brand ? 'Yes' : 'No'}</b></div>
     </div>
   `;
 
