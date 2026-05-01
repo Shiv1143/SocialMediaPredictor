@@ -1,30 +1,36 @@
 """
 Optional LLM explanation layer (Layer 3B).
 
-Uses a locally-running Ollama model to generate a rich natural-language
-explanation that a content manager can act on — instead of raw coefficient
-numbers.
+Priority order for generating explanations:
+  1. Ollama  — if a local Ollama server is running (OLLAMA_HOST)
+  2. Local HuggingFace model via `transformers` — already installed, no sudo,
+     downloads model on first use and caches it (~900 MB for the default model)
+  3. Template fallback — structured text, always available, no LLM needed
 
-Configuration (environment variables):
-  OLLAMA_HOST   URL of the Ollama server (default: http://localhost:11434)
-  OLLAMA_MODEL  Model to use (default: llama3.2)
+Environment variables:
+  OLLAMA_HOST        Ollama server URL  (default: http://localhost:11434)
+  OLLAMA_MODEL       Ollama model name  (default: llama3.2)
+  LOCAL_LLM_MODEL    HF model for local inference
+                     (default: Qwen/Qwen2.5-1.5B-Instruct)
+  LOCAL_LLM_ENABLED  Set to "false" to skip local model entirely (default: true)
 
-Falls back to a structured template explanation if Ollama is not reachable
-or if the call fails for any reason.
-
-The LLM is ONLY used for explanation generation — it never affects the
-predicted score, tier, or confidence. Those come from Ridge + KNN.
-
-Note: The OpenAI image vision path in main.py (_vision_summary) is separate
-and still uses OPENAI_API_KEY if set.
+The LLM is ONLY used for explanation text — it never affects predicted score,
+tier, or confidence. Those come from Ridge + KNN.
 """
 import logging
 import os
+import threading
 from typing import Optional
 
 import httpx
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Local-model pipeline cache (loaded once, reused across requests)
+# ---------------------------------------------------------------------------
+_local_pipe = None
+_local_pipe_lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
 # Config
@@ -42,6 +48,14 @@ def _ollama_model() -> str:
     return os.getenv("OLLAMA_MODEL", _DEFAULT_MODEL)
 
 
+def _local_model_name() -> str:
+    return os.getenv("LOCAL_LLM_MODEL", "Qwen/Qwen2.5-1.5B-Instruct")
+
+
+def _local_llm_enabled() -> bool:
+    return os.getenv("LOCAL_LLM_ENABLED", "true").lower() not in ("false", "0", "no")
+
+
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
@@ -57,21 +71,28 @@ async def generate_explanation(
     """
     Generate a human-readable explanation for the prediction.
 
-    Tries Ollama first; falls back to a structured template if Ollama is
-    not running or returns an error.
+    Priority:
+      1. Ollama (if server is reachable)
+      2. Local HuggingFace model via transformers (Qwen2.5-1.5B-Instruct by default)
+      3. Template fallback
     """
-    try:
-        return await _ollama_explanation(
-            post, prediction, similar_posts, key_factors,
-            brand_stats, brand_alignment_score
-        )
-    except Exception as e:
-        logger.warning("Ollama explanation failed (%s), using template fallback", e)
+    args = (post, prediction, similar_posts, key_factors, brand_stats, brand_alignment_score)
 
-    return _template_explanation(
-        post, prediction, similar_posts, key_factors,
-        brand_stats, brand_alignment_score
-    )
+    # 1. Try Ollama
+    try:
+        return await _ollama_explanation(*args)
+    except Exception as e:
+        logger.debug("Ollama not available (%s), trying local model", e)
+
+    # 2. Try local transformers model
+    if _local_llm_enabled():
+        try:
+            return await _local_explanation(*args)
+        except Exception as e:
+            logger.warning("Local model explanation failed (%s), using template fallback", e)
+
+    # 3. Template fallback
+    return _template_explanation(*args)
 
 
 # ---------------------------------------------------------------------------
@@ -84,69 +105,8 @@ async def _ollama_explanation(
 ) -> str:
     host = _ollama_host()
     model = _ollama_model()
-
-    brand = post.get("brand", "unknown").replace("_", " ")
-    tier = prediction.get("performance_tier", "medium")
-    est_er = prediction.get("predicted_engagement_rate", 0)
-    brand_median = brand_stats.get("median", 0)
-    content_group = prediction.get("model_details", {}).get("content_group", "reel")
-
-    # Build similar posts context (top 3)
-    sim_context = ""
-    for i, sp in enumerate(similar_posts[:3], 1):
-        sim_context += (
-            f"  {i}. '{sp['caption_snippet']}' "
-            f"→ {sp['engagement_rate']}% ER ({sp['performance_tier']})\n"
-        )
-
-    # Positive / negative factor context
-    positives = [f for f in key_factors if f["impact"] == "positive"][:3]
-    negatives = [f for f in key_factors if f["impact"] == "negative"][:3]
-    factor_context = ""
-    if positives:
-        factor_context += "Positive signals: " + ", ".join(f["description"] for f in positives) + ".\n"
-    if negatives:
-        factor_context += "Risks: " + ", ".join(f["description"] for f in negatives) + ".\n"
-
-    # Off-strategy note
-    alignment_note = ""
-    if brand_alignment_score is not None and brand_alignment_score < 0.35:
-        alignment_note = (
-            f"Note: This post's content is atypical for {brand} "
-            f"(brand alignment score: {brand_alignment_score:.2f}). "
-            "It may be exploring a new content direction."
-        )
-
-    # Collaborator tier note
-    collab_note = ""
-    collab_tier = post.get("collaborator_tier", 0)
-    if collab_tier > 0:
-        tier_labels = {1: "micro-influencer", 2: "mid-tier creator",
-                       3: "macro influencer", 4: "mega celebrity"}
-        collab_note = f"Collaborator type: {tier_labels.get(collab_tier, 'unknown')}."
-
-    prompt = f"""You are an expert Instagram content strategist for Indian beverage brands.
-
-Brand: {brand}
-Post type: {content_group} ({post.get('media_type', 'reel')}, {post.get('duration') or 'N/A'}s)
-Caption: {(post.get('caption') or '')[:300]}
-Visual: {(post.get('visual_summary') or 'Not provided')[:200]}
-{collab_note}
-
-Prediction: {tier.upper()} performance
-Estimated engagement rate: {est_er:.2f}% (brand median: {brand_median:.2f}%)
-
-Most similar historical posts:
-{sim_context}
-{factor_context}
-{alignment_note}
-
-Write a 3-4 sentence explanation a content manager can act on. Be specific about:
-1. Why this post is predicted to perform {tier}
-2. What the most similar historical posts tell us
-3. One concrete thing they could change to improve performance
-
-Do NOT use bullet points. Write in plain, direct prose. Keep it under 120 words."""
+    prompt = _build_prompt(post, prediction, similar_posts, key_factors,
+                           brand_stats, brand_alignment_score)
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.post(
@@ -167,7 +127,138 @@ Do NOT use bullet points. Write in plain, direct prose. Keep it under 120 words.
 
 
 # ---------------------------------------------------------------------------
-# Template fallback (Ollama not available)
+# Local HuggingFace model via transformers (no server, no sudo)
+# ---------------------------------------------------------------------------
+
+async def _local_explanation(
+    post, prediction, similar_posts, key_factors,
+    brand_stats, brand_alignment_score
+) -> str:
+    """
+    Generate explanation using a local HuggingFace model.
+
+    The pipeline is loaded once (first call takes ~5-10 seconds to load model
+    weights) and reused for all subsequent requests. Uses Apple MPS GPU on Mac
+    for fast inference — a 120-word response takes ~3-5 seconds.
+
+    Default model: Qwen/Qwen2.5-1.5B-Instruct (~900 MB, downloads once)
+    Override: LOCAL_LLM_MODEL=<any HF model ID>
+    """
+    import asyncio
+
+    # Build the prompt (same as Ollama path)
+    prompt = _build_prompt(post, prediction, similar_posts, key_factors,
+                           brand_stats, brand_alignment_score)
+
+    # Run the blocking pipeline call in a thread so it doesn't block the event loop
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(None, _run_local_pipeline, prompt)
+    return result
+
+
+def _run_local_pipeline(prompt: str) -> str:
+    """Blocking call — runs in a thread pool executor."""
+    global _local_pipe
+
+    if _local_pipe is None:
+        with _local_pipe_lock:
+            if _local_pipe is None:  # double-checked locking
+                import torch
+                from transformers import pipeline
+
+                model_name = _local_model_name()
+                logger.info("Loading local LLM: %s (first call only) …", model_name)
+
+                if torch.backends.mps.is_available():
+                    device = "mps"
+                    dtype = torch.float16
+                elif torch.cuda.is_available():
+                    device = "cuda"
+                    dtype = torch.float16
+                else:
+                    device = "cpu"
+                    dtype = torch.float32
+
+                _local_pipe = pipeline(
+                    "text-generation",
+                    model=model_name,
+                    device=device,
+                    torch_dtype=dtype,
+                    trust_remote_code=True,
+                )
+                logger.info("Local LLM ready on %s.", device)
+
+    messages = [{"role": "user", "content": prompt}]
+    output = _local_pipe(
+        messages,
+        max_new_tokens=180,
+        temperature=0.4,
+        do_sample=True,
+        pad_token_id=_local_pipe.tokenizer.eos_token_id,
+    )
+    # transformers returns the full conversation; extract the last assistant turn
+    generated = output[0]["generated_text"]
+    if isinstance(generated, list):
+        # Chat format — last element is the assistant response
+        return generated[-1]["content"].strip()
+    return str(generated).strip()
+
+
+def _build_prompt(
+    post, prediction, similar_posts, key_factors,
+    brand_stats, brand_alignment_score
+) -> str:
+    """Shared prompt builder used by both Ollama and local model paths."""
+    brand = post.get("brand", "unknown").replace("_", " ")
+    tier = prediction.get("performance_tier", "medium")
+    est_er = prediction.get("predicted_engagement_rate", 0)
+    brand_median = brand_stats.get("median", 0)
+    content_group = prediction.get("model_details", {}).get("content_group", "reel")
+
+    sim_context = ""
+    for i, sp in enumerate(similar_posts[:3], 1):
+        sim_context += f"  {i}. '{sp['caption_snippet']}' → {sp['engagement_rate']}% ER ({sp['performance_tier']})\n"
+
+    positives = [f for f in key_factors if f["impact"] == "positive"][:3]
+    negatives = [f for f in key_factors if f["impact"] == "negative"][:3]
+    factor_context = ""
+    if positives:
+        factor_context += "Positive signals: " + ", ".join(f["description"] for f in positives) + ".\n"
+    if negatives:
+        factor_context += "Risks: " + ", ".join(f["description"] for f in negatives) + ".\n"
+
+    alignment_note = ""
+    if brand_alignment_score is not None and brand_alignment_score < 0.35:
+        alignment_note = f"Note: atypical content for {brand} (brand alignment: {brand_alignment_score:.2f}).\n"
+
+    collab_note = ""
+    collab_tier = post.get("collaborator_tier", 0)
+    if collab_tier > 0:
+        tier_labels = {1: "micro-influencer", 2: "mid-tier creator", 3: "macro influencer", 4: "mega celebrity"}
+        collab_note = f"Collaborator type: {tier_labels.get(collab_tier, 'unknown')}.\n"
+
+    return (
+        f"You are an expert Instagram content strategist for Indian beverage brands.\n\n"
+        f"Brand: {brand}\n"
+        f"Post type: {content_group} ({post.get('media_type', 'reel')}, {post.get('duration') or 'N/A'}s)\n"
+        f"Caption: {(post.get('caption') or '')[:300]}\n"
+        f"Visual: {(post.get('visual_summary') or 'Not provided')[:200]}\n"
+        f"{collab_note}"
+        f"\nPrediction: {tier.upper()} performance\n"
+        f"Estimated engagement rate: {est_er:.2f}% (brand median: {brand_median:.2f}%)\n"
+        f"\nMost similar historical posts:\n{sim_context}"
+        f"{factor_context}"
+        f"{alignment_note}"
+        f"\nWrite a 3-4 sentence explanation a content manager can act on. Be specific about:\n"
+        f"1. Why this post is predicted to perform {tier}\n"
+        f"2. What the most similar historical posts tell us\n"
+        f"3. One concrete thing they could change to improve performance\n\n"
+        f"Do NOT use bullet points. Write in plain, direct prose. Keep it under 120 words."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Template fallback (no LLM available)
 # ---------------------------------------------------------------------------
 
 def _template_explanation(

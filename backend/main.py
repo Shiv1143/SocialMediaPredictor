@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 from typing import List, Optional
 
+import httpx
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
@@ -184,6 +185,21 @@ async def predict_json(request: PredictRequest):
     except Exception as exc:
         logger.exception("Prediction error")
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/analyze-media", tags=["prediction"])
+async def analyze_media(media_file: UploadFile = File(...)):
+    """
+    Analyze an uploaded image or video and return an auto-generated visual description.
+    Called immediately after file selection so users can see what the AI understood
+    before they submit a prediction.
+    """
+    try:
+        summary = await _vision_summary(media_file)
+        return {"visual_summary": summary}
+    except Exception as exc:
+        logger.warning("Media analysis failed: %s", exc)
+        return {"visual_summary": ""}
 
 
 @app.post("/brands/register", tags=["brands"])

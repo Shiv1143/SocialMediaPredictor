@@ -351,6 +351,15 @@
           <img id="img-preview" style="display:none;width:100%;max-height:220px;object-fit:cover" />
           <video id="vid-preview" style="display:none;width:100%;max-height:220px" controls muted playsinline></video>
         </div>
+        <!-- Live AI visual analysis result -->
+        <div id="visual-analysis-box" style="display:none;margin-top:12px;border-radius:10px;border:1px solid rgba(86,207,178,0.35);background:linear-gradient(135deg,rgba(86,207,178,0.08) 0%,rgba(124,106,247,0.06) 100%);overflow:hidden">
+          <div style="display:flex;align-items:center;gap:8px;padding:9px 14px;background:rgba(86,207,178,0.12);border-bottom:1px solid rgba(86,207,178,0.2)">
+            <span style="font-size:15px" id="va-icon">✨</span>
+            <span style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:1px;color:var(--accent2)">AI Visual Analysis</span>
+            <span style="margin-left:auto;font-size:10px;color:var(--muted)" id="va-status">analyzing…</span>
+          </div>
+          <div id="va-text" style="padding:12px 14px;font-size:13px;color:var(--text);line-height:1.7"></div>
+        </div>
       </div>
 
       <button class="btn-predict" id="predict-btn" onclick="submitPrediction()">
@@ -430,33 +439,65 @@ function getSelectedBrand() {
   return sel;
 }
 
-// ── Media upload UI ──
-document.getElementById('media-file').addEventListener('change', function() {
-  const zone = document.getElementById('upload-zone');
-  const label = document.getElementById('upload-label');
+// ── Media upload UI + live AI analysis ──
+document.getElementById('media-file').addEventListener('change', async function() {
+  const zone     = document.getElementById('upload-zone');
+  const label    = document.getElementById('upload-label');
   const previewWrap = document.getElementById('media-preview-wrap');
-  const imgPreview = document.getElementById('img-preview');
-  const vidPreview = document.getElementById('vid-preview');
-  const icon = document.getElementById('upload-icon');
+  const imgPreview  = document.getElementById('img-preview');
+  const vidPreview  = document.getElementById('vid-preview');
+  const icon     = document.getElementById('upload-icon');
+  const vaBox    = document.getElementById('visual-analysis-box');
+  const vaText   = document.getElementById('va-text');
+  const vaStatus = document.getElementById('va-status');
+  const vaIconEl = document.getElementById('va-icon');
 
-  if (this.files && this.files[0]) {
-    const file = this.files[0];
-    zone.classList.add('has-file');
-    label.textContent = `✓ ${file.name}`;
-    previewWrap.style.display = 'block';
+  if (!this.files || !this.files[0]) return;
+  const file = this.files[0];
 
-    const url = URL.createObjectURL(file);
-    if (file.type.startsWith('video/')) {
-      icon.textContent = '🎬';
-      imgPreview.style.display = 'none';
-      vidPreview.src = url;
-      vidPreview.style.display = 'block';
+  // Show file name + media preview
+  zone.classList.add('has-file');
+  label.textContent = `✓ ${file.name}`;
+  previewWrap.style.display = 'block';
+  const url = URL.createObjectURL(file);
+  if (file.type.startsWith('video/')) {
+    icon.textContent = '🎬';
+    imgPreview.style.display = 'none';
+    vidPreview.src = url;
+    vidPreview.style.display = 'block';
+  } else {
+    icon.textContent = '🖼';
+    vidPreview.style.display = 'none';
+    imgPreview.src = url;
+    imgPreview.style.display = 'block';
+  }
+
+  // Show analysis box in "analyzing" state
+  vaBox.style.display = 'block';
+  vaIconEl.textContent = '⏳';
+  vaStatus.textContent = 'analyzing…';
+  vaText.innerHTML = '<span style="color:var(--muted);font-style:italic">AI is reading your creative…</span>';
+
+  // Call the analyze-media endpoint
+  try {
+    const form = new FormData();
+    form.append('media_file', file);
+    const res  = await fetch(`${API}/api/analyze-media`, { method: 'POST', body: form });
+    const data = await res.json();
+
+    if (data.visual_summary) {
+      vaIconEl.textContent = '✨';
+      vaStatus.textContent = 'auto-generated';
+      vaText.textContent = data.visual_summary;
     } else {
-      icon.textContent = '🖼';
-      vidPreview.style.display = 'none';
-      imgPreview.src = url;
-      imgPreview.style.display = 'block';
+      vaIconEl.textContent = '⚠️';
+      vaStatus.textContent = 'unavailable';
+      vaText.innerHTML = '<span style="color:var(--muted);font-style:italic">Could not analyze — Ollama or OpenAI not configured. Prediction will still work.</span>';
     }
+  } catch(e) {
+    vaIconEl.textContent = '⚠️';
+    vaStatus.textContent = 'error';
+    vaText.innerHTML = `<span style="color:var(--muted);font-style:italic">Analysis failed: ${e.message}</span>`;
   }
 });
 
@@ -470,8 +511,7 @@ async function submitPrediction() {
   if (!brand || brand === '__other__') { alert('Please enter a brand name.'); return; }
 
   btn.disabled = true;
-  const hasMedia = document.getElementById('media-file').files[0];
-  btn.innerHTML = `<span class="spinner"></span>${hasMedia ? 'Analyzing creative & predicting…' : 'Predicting…'}`;
+  btn.innerHTML = '<span class="spinner"></span>Predicting…';
 
   const form = new FormData();
   form.append('caption', caption);
@@ -607,15 +647,7 @@ function renderResult(d) {
     });
   }
 
-  // Auto-generated visual description
-  if (d.visual_summary_used) {
-    html += `
-      <div class="section-label">Auto-Generated Visual Description</div>
-      <div style="font-size:13px;color:var(--muted);background:var(--surface2);border-radius:8px;padding:12px;line-height:1.6;font-style:italic">
-        "${d.visual_summary_used}"
-      </div>
-    `;
-  }
+  // (visual description now shown live in the form panel after upload)
 
   // Model internals
   const collabTierLabels = {0:'unknown',1:'micro',2:'mid-tier',3:'macro',4:'mega'};
