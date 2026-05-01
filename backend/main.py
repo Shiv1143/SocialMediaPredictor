@@ -13,7 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from backend.config import BASE_DIR, MODELS_DIR
-from backend.llm.explainer import generate_explanation
+from backend.llm.explainer import generate_explanation, preload_local_model
 from backend.models.predictor import HybridPredictor
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -48,6 +48,8 @@ async def startup():
         logger.warning(
             "No trained model found at %s — run `python train.py` first.", model_path
         )
+    # Pre-warm local LLM in background so it's ready before first prediction
+    preload_local_model()
 
 
 def _get_predictor() -> HybridPredictor:
@@ -82,7 +84,9 @@ async def serve_frontend():
 
 @app.get("/health", tags=["meta"])
 async def health():
-    return {"status": "ok", "model_loaded": _predictor is not None}
+    from backend.llm.explainer import _local_pipe, _local_pipe_loading
+    llm_status = "ready" if _local_pipe is not None else ("loading" if _local_pipe_loading else "unavailable")
+    return {"status": "ok", "model_loaded": _predictor is not None, "llm_status": llm_status}
 
 
 @app.get("/brands", tags=["meta"])

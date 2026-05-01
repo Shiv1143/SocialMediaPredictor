@@ -31,6 +31,33 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 _local_pipe = None
 _local_pipe_lock = threading.Lock()
+_local_pipe_loading = False  # True while background load is in progress
+
+
+def preload_local_model():
+    """
+    Start loading the local model in a background thread.
+
+    Call this at server startup so the model is ready before the first
+    prediction request arrives. Falls back to template while loading.
+    """
+    if not _local_llm_enabled():
+        return
+
+    def _load():
+        global _local_pipe_loading
+        _local_pipe_loading = True
+        try:
+            logger.info("Pre-warming local LLM in background …")
+            _run_local_pipeline("Say hi.")   # trigger load + cache
+            logger.info("Local LLM warm and ready.")
+        except Exception as e:
+            logger.warning("Local LLM pre-warm failed: %s", e)
+        finally:
+            _local_pipe_loading = False
+
+    t = threading.Thread(target=_load, daemon=True)
+    t.start()
 
 # ---------------------------------------------------------------------------
 # Config
