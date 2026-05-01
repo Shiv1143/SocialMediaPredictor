@@ -2,6 +2,7 @@ import base64
 import json
 import logging
 import os
+import threading
 from pathlib import Path
 from typing import List, Optional
 
@@ -35,6 +36,31 @@ app.add_middleware(
 # Global predictor instance — loaded once at startup
 _predictor: Optional[HybridPredictor] = None
 
+# BLIP vision model cache — loaded once in background at startup
+_blip_processor = None
+_blip_model = None
+_blip_lock = threading.Lock()
+
+
+def _preload_blip():
+    """Load BLIP image-captioning model in a background thread at startup."""
+    global _blip_processor, _blip_model
+    try:
+        import torch
+        from transformers import BlipForConditionalGeneration, BlipProcessor
+
+        model_id = os.getenv("BLIP_MODEL", "Salesforce/blip-image-captioning-base")
+        logger.info("Pre-warming BLIP vision model (%s) …", model_id)
+        with _blip_lock:
+            _blip_processor = BlipProcessor.from_pretrained(model_id)
+            device = "mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu")
+            _blip_model = BlipForConditionalGeneration.from_pretrained(
+                model_id, torch_dtype=torch.float16
+            ).to(device)
+        logger.info("BLIP vision model ready on %s.", device)
+    except Exception as e:
+        logger.warning("BLIP pre-warm failed: %s", e)
+
 
 @app.on_event("startup")
 async def startup():
@@ -48,8 +74,9 @@ async def startup():
         logger.warning(
             "No trained model found at %s — run `python train.py` first.", model_path
         )
-    # Pre-warm local LLM in background so it's ready before first prediction
+    # Pre-warm local LLM and vision model in background
     preload_local_model()
+    threading.Thread(target=_preload_blip, daemon=True).start()
 
 
 def _get_predictor() -> HybridPredictor:
@@ -86,7 +113,13 @@ async def serve_frontend():
 async def health():
     from backend.llm.explainer import _local_pipe, _local_pipe_loading
     llm_status = "ready" if _local_pipe is not None else ("loading" if _local_pipe_loading else "unavailable")
-    return {"status": "ok", "model_loaded": _predictor is not None, "llm_status": llm_status}
+    vision_status = "ready" if _blip_model is not None else "loading"
+    return {
+        "status": "ok",
+        "model_loaded": _predictor is not None,
+        "llm_status": llm_status,
+        "vision_status": vision_status,
+    }
 
 
 @app.get("/brands", tags=["meta"])
@@ -379,18 +412,23 @@ async def _vision_summary(media: UploadFile) -> str:
     if not frames:
         return ""
 
-    # Try Ollama vision first
+    # 1. Ollama llava (if running)
     summary = await _ollama_vision(frames, is_video)
     if summary:
         return summary
 
-    # Fallback: OpenAI vision (images only — OpenAI doesn't accept video frames from non-URL)
+    # 2. OpenAI GPT-4o-mini Vision (if API key set, images only)
     if not is_video:
         api_key = os.getenv("OPENAI_API_KEY")
         if api_key:
             summary = await _openai_vision(frames[0], frame_mime, api_key)
             if summary:
                 return summary
+
+    # 3. Local BLIP model (always available after startup warm-up)
+    summary = await _blip_vision(frames, is_video)
+    if summary:
+        return summary
 
     return ""
 
@@ -497,4 +535,54 @@ async def _openai_vision(image_bytes: bytes, mime: str, api_key: str) -> str:
         return resp.choices[0].message.content or ""
     except Exception as e:
         logger.warning("OpenAI vision fallback failed: %s", e)
+        return ""
+
+
+async def _blip_vision(frames: list, is_video: bool) -> str:
+    """
+    Describe frames using the local BLIP image-captioning model.
+    No API key, no server — runs entirely on-device using Apple MPS.
+    """
+    if _blip_processor is None or _blip_model is None:
+        logger.debug("BLIP model not yet loaded, skipping local vision")
+        return ""
+
+    import asyncio
+
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _run_blip, frames, is_video)
+
+
+def _run_blip(frames: list, is_video: bool) -> str:
+    """Blocking BLIP inference — runs in thread pool."""
+    try:
+        import torch
+        from PIL import Image
+        import io
+
+        device = next(_blip_model.parameters()).device
+        captions = []
+
+        for i, frame_bytes in enumerate(frames):
+            image = Image.open(io.BytesIO(frame_bytes)).convert("RGB")
+            # Conditional captioning with a context hint gives more relevant output
+            context = "an instagram creative showing"
+            inputs = _blip_processor(
+                image, text=context, return_tensors="pt"
+            ).to(device, torch.float16)
+
+            with torch.no_grad():
+                out = _blip_model.generate(**inputs, max_new_tokens=80)
+            caption = _blip_processor.decode(out[0], skip_special_tokens=True)
+            captions.append(caption)
+
+        if not captions:
+            return ""
+        if len(captions) == 1:
+            return captions[0]
+        # For video: combine frame captions into one description
+        return " | ".join(f"[Frame {i+1}] {c}" for i, c in enumerate(captions))
+
+    except Exception as e:
+        logger.warning("BLIP inference failed: %s", e)
         return ""
