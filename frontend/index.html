@@ -341,17 +341,46 @@
       </div>
 
       <div class="form-group">
-        <label>Upload Creative <span style="color:var(--muted);font-weight:400">(image or video — visual description auto-generated)</span></label>
-        <div class="upload-zone" id="upload-zone">
-          <input type="file" id="media-file" accept="image/*,video/*" />
-          <div class="icon" id="upload-icon">🎬</div>
-          <p id="upload-label">Click or drag to upload an image or video reel</p>
+        <label>Creative <span style="color:var(--muted);font-weight:400">(image or video — visual description auto-generated)</span></label>
+
+        <!-- Upload / URL toggle -->
+        <div style="display:flex;gap:0;margin-bottom:10px;border:1px solid var(--border);border-radius:8px;overflow:hidden">
+          <button type="button" id="tab-upload" onclick="setMediaTab('upload')"
+            style="flex:1;padding:7px;font-size:12px;font-weight:600;border:none;cursor:pointer;background:var(--accent);color:#fff;transition:all .2s">
+            Upload File
+          </button>
+          <button type="button" id="tab-url" onclick="setMediaTab('url')"
+            style="flex:1;padding:7px;font-size:12px;font-weight:600;border:none;cursor:pointer;background:var(--surface2);color:var(--muted);transition:all .2s">
+            Paste URL
+          </button>
         </div>
-        <div id="media-preview-wrap" style="display:none;margin-top:10px;border-radius:8px;overflow:hidden;max-height:220px;background:var(--surface2)">
-          <img id="img-preview" style="display:none;width:100%;max-height:220px;object-fit:cover" />
-          <video id="vid-preview" style="display:none;width:100%;max-height:220px" controls muted playsinline></video>
+
+        <!-- Upload pane -->
+        <div id="pane-upload">
+          <div class="upload-zone" id="upload-zone">
+            <input type="file" id="media-file" accept="image/*,video/*" />
+            <div class="icon" id="upload-icon">🎬</div>
+            <p id="upload-label">Click or drag to upload an image or video reel</p>
+          </div>
+          <div id="media-preview-wrap" style="display:none;margin-top:10px;border-radius:8px;overflow:hidden;max-height:220px;background:var(--surface2)">
+            <img id="img-preview" style="display:none;width:100%;max-height:220px;object-fit:cover" />
+            <video id="vid-preview" style="display:none;width:100%;max-height:220px" controls muted playsinline></video>
+          </div>
         </div>
-        <!-- Live AI visual analysis result -->
+
+        <!-- URL pane -->
+        <div id="pane-url" style="display:none">
+          <div style="display:flex;gap:8px;align-items:center">
+            <input id="media-url" type="url" placeholder="https://… (direct link to image or video)" style="flex:1" />
+            <button type="button" onclick="analyzeUrl()" id="url-analyze-btn"
+              style="padding:9px 14px;background:var(--accent);color:#fff;border:none;border-radius:8px;font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap">
+              Analyze
+            </button>
+          </div>
+          <div style="font-size:11px;color:var(--muted);margin-top:5px">Paste a direct link to any public image or video (Instagram CDN, S3, etc.)</div>
+        </div>
+
+        <!-- Live AI visual analysis result (shared by both panes) -->
         <div id="visual-analysis-box" style="display:none;margin-top:12px;border-radius:10px;border:1px solid rgba(86,207,178,0.35);background:linear-gradient(135deg,rgba(86,207,178,0.08) 0%,rgba(124,106,247,0.06) 100%);overflow:hidden">
           <div style="display:flex;align-items:center;gap:8px;padding:9px 14px;background:rgba(86,207,178,0.12);border-bottom:1px solid rgba(86,207,178,0.2)">
             <span style="font-size:15px" id="va-icon">✨</span>
@@ -359,6 +388,12 @@
             <span style="margin-left:auto;font-size:10px;color:var(--muted)" id="va-status">analyzing…</span>
           </div>
           <div id="va-text" style="padding:12px 14px;font-size:13px;color:var(--text);line-height:1.7"></div>
+        </div>
+
+        <!-- Manual override -->
+        <div style="margin-top:10px">
+          <label for="visual_summary_override" style="font-size:12px;color:var(--muted);font-weight:500">Override visual description <span style="font-weight:400">(optional — replaces AI analysis above for prediction)</span></label>
+          <textarea id="visual_summary_override" rows="2" placeholder="e.g. Two friends on a rooftop with Sprite bottles, hot summer day, bright colours…" style="margin-top:5px;resize:vertical;min-height:58px;font-size:13px"></textarea>
         </div>
       </div>
 
@@ -439,6 +474,61 @@ function getSelectedBrand() {
   return sel;
 }
 
+// ── Upload / URL tab toggle ──
+function setMediaTab(tab) {
+  const isUpload = tab === 'upload';
+  document.getElementById('pane-upload').style.display = isUpload ? 'block' : 'none';
+  document.getElementById('pane-url').style.display   = isUpload ? 'none'  : 'block';
+  document.getElementById('tab-upload').style.background = isUpload ? 'var(--accent)' : 'var(--surface2)';
+  document.getElementById('tab-upload').style.color     = isUpload ? '#fff' : 'var(--muted)';
+  document.getElementById('tab-url').style.background   = isUpload ? 'var(--surface2)' : 'var(--accent)';
+  document.getElementById('tab-url').style.color        = isUpload ? 'var(--muted)' : '#fff';
+  // Reset AI analysis box when switching tabs
+  document.getElementById('visual-analysis-box').style.display = 'none';
+}
+
+// ── URL analyze button ──
+async function analyzeUrl() {
+  const url = document.getElementById('media-url').value.trim();
+  if (!url) { alert('Please paste a URL first.'); return; }
+
+  const vaBox    = document.getElementById('visual-analysis-box');
+  const vaText   = document.getElementById('va-text');
+  const vaStatus = document.getElementById('va-status');
+  const vaIconEl = document.getElementById('va-icon');
+  const btn      = document.getElementById('url-analyze-btn');
+
+  vaBox.style.display = 'block';
+  vaIconEl.textContent = '⏳';
+  vaStatus.textContent = 'analyzing…';
+  vaText.innerHTML = '<span style="color:var(--muted);font-style:italic">AI is reading your creative…</span>';
+  btn.disabled = true;
+  btn.textContent = 'Analyzing…';
+
+  try {
+    const form = new FormData();
+    form.append('media_url', url);
+    const res  = await fetch(`${API}/api/analyze-media`, { method: 'POST', body: form });
+    const data = await res.json();
+    if (data.visual_summary) {
+      vaIconEl.textContent = '✨';
+      vaStatus.textContent = 'auto-generated';
+      vaText.textContent = data.visual_summary;
+    } else {
+      vaIconEl.textContent = '⚠️';
+      vaStatus.textContent = 'unavailable';
+      vaText.innerHTML = '<span style="color:var(--muted);font-style:italic">Could not analyze — vision model unavailable. Prediction will still work.</span>';
+    }
+  } catch(e) {
+    vaIconEl.textContent = '⚠️';
+    vaStatus.textContent = 'error';
+    vaText.innerHTML = `<span style="color:var(--muted);font-style:italic">Analysis failed: ${e.message}</span>`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Analyze';
+  }
+}
+
 // ── Media upload UI + live AI analysis ──
 document.getElementById('media-file').addEventListener('change', async function() {
   const zone     = document.getElementById('upload-zone');
@@ -501,11 +591,43 @@ document.getElementById('media-file').addEventListener('change', async function(
   }
 });
 
-// ── Submit ──
+// ── Build prediction payload as a plain JSON object ──
+function buildPayload() {
+  const caption  = document.getElementById('caption').value.trim();
+  const brand    = getSelectedBrand();
+  const payload  = {
+    caption,
+    brand,
+    media_type: document.getElementById('media_type').value,
+  };
+
+  const dur = document.getElementById('duration').value;
+  if (dur) payload.duration = parseInt(dur);
+
+  const collab = document.getElementById('collaborators').value.trim();
+  if (collab) {
+    payload.collaborators   = collab.split(',').map(s => s.trim()).filter(Boolean);
+    payload.is_collaborated = true;
+    const cfc = document.getElementById('collaborator_follower_count').value;
+    if (cfc) payload.collaborator_follower_count = parseInt(cfc);
+  } else {
+    payload.is_collaborated = false;
+  }
+
+  const postedAt = document.getElementById('posted_at').value;
+  if (postedAt) payload.posted_at = new Date(postedAt).toISOString();
+
+  const override = document.getElementById('visual_summary_override').value.trim();
+  if (override) payload.visual_summary = override;
+
+  return payload;
+}
+
+// ── Submit — uses streaming endpoint for instant results ──
 async function submitPrediction() {
-  const btn = document.getElementById('predict-btn');
+  const btn     = document.getElementById('predict-btn');
   const caption = document.getElementById('caption').value.trim();
-  const brand = getSelectedBrand();
+  const brand   = getSelectedBrand();
 
   if (!caption) { alert('Please enter a caption.'); return; }
   if (!brand || brand === '__other__') { alert('Please enter a brand name.'); return; }
@@ -513,48 +635,94 @@ async function submitPrediction() {
   btn.disabled = true;
   btn.innerHTML = '<span class="spinner"></span>Predicting…';
 
-  const form = new FormData();
-  form.append('caption', caption);
-  form.append('brand', brand);
-  form.append('media_type', document.getElementById('media_type').value);
+  // If a file or URL is provided, fall back to the multipart upload endpoint
+  // (streaming endpoint uses JSON body so can't carry a file)
+  const mediaFile = document.getElementById('media-file').files[0];
+  const mediaUrl  = document.getElementById('media-url').value.trim();
+  const hasMedia  = mediaFile || (mediaUrl && document.getElementById('pane-url').style.display !== 'none');
 
-  const dur = document.getElementById('duration').value;
-  if (dur) form.append('duration', dur);
+  if (hasMedia) {
+    // ── Multipart path (file / URL upload) — non-streaming ──
+    const form = new FormData();
+    const p = buildPayload();
+    Object.entries(p).forEach(([k, v]) => {
+      if (Array.isArray(v)) form.append(k, v.join(','));
+      else if (v !== undefined && v !== null) form.append(k, v);
+    });
+    if (mediaFile) form.append('media_file', mediaFile);
+    if (mediaUrl && !mediaFile) form.append('media_url', mediaUrl);
 
-  const collab = document.getElementById('collaborators').value.trim();
-  if (collab) {
-    form.append('collaborators', collab);
-    form.append('is_collaborated', 'true');
-    const collabFC = document.getElementById('collaborator_follower_count').value;
-    if (collabFC) form.append('collaborator_follower_count', collabFC);
-  } else {
-    form.append('is_collaborated', 'false');
+    try {
+      const res = await fetch(`${API}/api/predict/upload`, { method: 'POST', body: form });
+      if (!res.ok) { const e = await res.json(); throw new Error(e.detail || `HTTP ${res.status}`); }
+      renderResult(await res.json());
+    } catch(e) {
+      renderError(e.message);
+    } finally {
+      btn.disabled = false;
+      btn.innerHTML = 'Predict Performance';
+    }
+    return;
   }
 
-  const postedAt = document.getElementById('posted_at').value;
-  if (postedAt) form.append('posted_at', new Date(postedAt).toISOString());
-
-  const mediaFile = document.getElementById('media-file').files[0];
-  if (mediaFile) form.append('media_file', mediaFile);
-
+  // ── Streaming path (no media file) ──
   try {
-    const res = await fetch(`${API}/api/predict/upload`, { method: 'POST', body: form });
-    if (!res.ok) {
-      const err = await res.json();
-      throw new Error(err.detail || `HTTP ${res.status}`);
+    const res = await fetch(`${API}/api/predict/stream`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(buildPayload()),
+    });
+    if (!res.ok) { const e = await res.json(); throw new Error(e.detail || `HTTP ${res.status}`); }
+
+    const reader  = res.body.getReader();
+    const decoder = new TextDecoder();
+    let   buffer  = '';
+    let   rendered = false;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop();   // keep incomplete last line
+
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        let evt;
+        try { evt = JSON.parse(line); } catch { continue; }
+
+        if (evt.event === 'prediction') {
+          // ── Render scores immediately ──
+          renderResult(evt, true);   // true = explanation still loading
+          rendered = true;
+          btn.disabled = false;
+          btn.innerHTML = 'Predict Performance';
+        } else if (evt.event === 'explanation_token') {
+          // ── Append token to explanation text ──
+          const el = document.getElementById('stream-explanation');
+          if (el) {
+            if (el.hasAttribute('data-streaming') && el.querySelector('span')) {
+              el.textContent = '';  // clear placeholder on first real token
+            }
+            el.textContent += evt.token;
+          }
+        } else if (evt.event === 'done') {
+          const el = document.getElementById('stream-explanation');
+          if (el) el.removeAttribute('data-streaming');
+        }
+      }
     }
-    const data = await res.json();
-    renderResult(data);
+    if (!rendered) throw new Error('No prediction received');
   } catch(e) {
     renderError(e.message);
-  } finally {
     btn.disabled = false;
     btn.innerHTML = 'Predict Performance';
   }
 }
 
 // ── Render result ──
-function renderResult(d) {
+function renderResult(d, streaming = false) {
   document.getElementById('placeholder-card').style.display = 'none';
   const panel = document.getElementById('result-panel');
   panel.style.display = 'block';
@@ -565,6 +733,12 @@ function renderResult(d) {
   const exp = d.explanation || {};
   const bc  = exp.brand_context || {};
   const md  = d.model_details  || {};
+
+  // Explanation: if streaming, render an empty element that tokens will fill;
+  // otherwise render the completed summary text
+  const explanationHtml = streaming
+    ? `<div class="summary-text" id="stream-explanation" data-streaming="1"><span style="color:var(--muted);font-style:italic">Generating explanation…</span></div>`
+    : `<div class="summary-text">${exp.summary || ''}</div>`;
 
   let html = `
     <div class="tier-badge tier-${tierColor}">${tierIcon} ${tier.charAt(0).toUpperCase()+tier.slice(1)} Performance</div>
@@ -585,7 +759,7 @@ function renderResult(d) {
       <div class="score-val">${(d.confidence*100).toFixed(0)}%</div>
     </div>
 
-    <div class="summary-text">${exp.summary || ''}</div>
+    ${explanationHtml}
   `;
 
   // Warnings (e.g. unknown brand)

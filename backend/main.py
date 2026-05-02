@@ -9,7 +9,7 @@ from typing import List, Optional
 import httpx
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -224,15 +224,102 @@ async def predict_json(request: PredictRequest):
         raise HTTPException(status_code=500, detail=str(exc))
 
 
-@app.post("/api/analyze-media", tags=["prediction"])
-async def analyze_media(media_file: UploadFile = File(...)):
+@app.post("/api/predict/stream", tags=["prediction"])
+async def predict_stream(request: PredictRequest):
     """
-    Analyze an uploaded image or video and return an auto-generated visual description.
-    Called immediately after file selection so users can see what the AI understood
-    before they submit a prediction.
+    Streaming version of /api/predict.
+
+    Returns a stream of newline-delimited JSON events:
+      1. {"event": "prediction", ...full prediction object...}   — emitted immediately (~330ms)
+      2. {"event": "explanation_token", "token": "..."}          — one per LLM token as generated
+      3. {"event": "done"}                                        — stream complete
+
+    The frontend can show the prediction result instantly and fill in the
+    explanation text progressively as tokens arrive.
+    """
+    p = _get_predictor()
+    post = _build_post_dict(request)
+
+    try:
+        result = p.predict(post)
+    except Exception as exc:
+        logger.exception("Prediction error")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    async def event_stream():
+        # ── Event 1: emit prediction immediately ──
+        yield json.dumps({"event": "prediction", **result}) + "\n"
+
+        # ── Event 2+: stream LLM explanation tokens ──
+        exp = result.get("explanation", {})
+        brand = post.get("brand", "unknown")
+        brand_stats = p.brand_stats.get(brand) or p.brand_stats.get("_global", {})
+        alignment = result.get("model_details", {}).get("brand_alignment_score")
+
+        from backend.llm.explainer import _build_prompt, _ollama_host, _ollama_model, _template_explanation
+        prompt = _build_prompt(
+            post, result,
+            exp.get("similar_posts", []),
+            exp.get("key_factors", []),
+            brand_stats, alignment,
+        )
+        host = _ollama_host()
+        model = _ollama_model()
+
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                async with client.stream(
+                    "POST", f"{host}/api/chat",
+                    json={
+                        "model": model,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "stream": True,
+                        "think": False,
+                        "options": {"temperature": 0.4, "num_predict": 150},
+                    },
+                ) as resp:
+                    resp.raise_for_status()
+                    async for line in resp.aiter_lines():
+                        if not line:
+                            continue
+                        try:
+                            chunk = json.loads(line)
+                            token = chunk.get("message", {}).get("content", "")
+                            if token:
+                                yield json.dumps({"event": "explanation_token", "token": token}) + "\n"
+                            if chunk.get("done"):
+                                break
+                        except json.JSONDecodeError:
+                            continue
+        except Exception as e:
+            logger.warning("Streaming explanation failed (%s), sending template", e)
+            fallback = _template_explanation(
+                post, result, exp.get("similar_posts", []),
+                exp.get("key_factors", []), brand_stats, alignment,
+            )
+            yield json.dumps({"event": "explanation_token", "token": fallback}) + "\n"
+
+        yield json.dumps({"event": "done"}) + "\n"
+
+    return StreamingResponse(event_stream(), media_type="application/x-ndjson")
+
+
+@app.post("/api/analyze-media", tags=["prediction"])
+async def analyze_media(
+    media_file: Optional[UploadFile] = File(None),
+    media_url: Optional[str] = Form(None),
+):
+    """
+    Analyze an uploaded image/video or a URL and return an auto-generated
+    visual description. Accepts either a file upload or a public URL.
     """
     try:
-        summary = await _vision_summary(media_file)
+        if media_url and media_url.strip():
+            summary = await _vision_summary_from_url(media_url.strip())
+        elif media_file:
+            summary = await _vision_summary(media_file)
+        else:
+            return {"visual_summary": "", "error": "Provide media_file or media_url"}
         return {"visual_summary": summary}
     except Exception as exc:
         logger.warning("Media analysis failed: %s", exc)
@@ -287,22 +374,36 @@ async def predict_upload(
     collaborator_follower_count: Optional[int] = Form(None),
     posted_at: Optional[str] = Form(None),
     media_file: Optional[UploadFile] = File(None),
+    media_url: Optional[str] = Form(None),
+    visual_summary: Optional[str] = Form(None),
 ):
     """
-    Same as `/api/predict` but accepts `multipart/form-data` so the frontend
-    can upload a creative image directly.  If an image is provided and no
-    `visual_summary` is supplied, the system will attempt to describe it via
-    the OpenAI Vision API (requires `OPENAI_API_KEY` in env).
+    Same as `/api/predict` but accepts `multipart/form-data`.
+
+    Creative input priority (first wins):
+      1. `visual_summary` — user-typed description (overrides everything)
+      2. `media_url`      — public URL to an image or video
+      3. `media_file`     — uploaded file
     """
     p = _get_predictor()
 
-    img_summary = ""
-    if media_file:
+    # User-provided description takes highest priority
+    if visual_summary and visual_summary.strip():
+        final_summary = visual_summary.strip()
+    elif media_url and media_url.strip():
         try:
-            img_summary = await _vision_summary(media_file)
+            final_summary = await _vision_summary_from_url(media_url.strip())
+        except Exception as exc:
+            logger.warning("Vision summary from URL failed: %s", exc)
+            final_summary = ""
+    elif media_file:
+        try:
+            final_summary = await _vision_summary(media_file)
         except Exception as exc:
             logger.warning("Vision summary failed: %s", exc)
-            img_summary = ""
+            final_summary = ""
+    else:
+        final_summary = ""
 
     collab_list = [c.strip() for c in collaborators.split(",") if c.strip()]
 
@@ -316,14 +417,14 @@ async def predict_upload(
         "num_collaborators": len(collab_list),
         "collaborator_follower_count": collaborator_follower_count,
         "created_at": posted_at,
-        "visual_summary": img_summary,
+        "visual_summary": final_summary,
         "followers": p.brand_stats.get(brand, {}).get("median_followers", 100_000),
     }
 
     try:
         result = p.predict(post)
         result = await _enrich_explanation(post, result, p)
-        result["visual_summary_used"] = img_summary
+        result["visual_summary_used"] = final_summary
         return result
     except Exception as exc:
         logger.exception("Prediction error")
@@ -384,6 +485,47 @@ _VISION_PROMPT = (
     "4) overall mood and energy. "
     "Keep it under 120 words."
 )
+
+
+async def _vision_summary_from_url(url: str) -> str:
+    """
+    Fetch media from a public URL and run it through the same vision pipeline
+    as an uploaded file. Supports images and videos (mp4, mov, webm, etc.).
+    """
+    VIDEO_EXTS = {"mp4", "mov", "avi", "webm", "mkv", "m4v"}
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+        resp = await client.get(url)
+        resp.raise_for_status()
+        contents = resp.content
+        content_type = resp.headers.get("content-type", "").split(";")[0].strip()
+
+    # Detect video by content-type or URL extension
+    ext = url.lower().split("?")[0].rsplit(".", 1)[-1] if "." in url else ""
+    is_video = content_type.startswith("video/") or ext in VIDEO_EXTS
+
+    if is_video:
+        frames = _extract_video_frames(contents)
+        frame_mime = "image/jpeg"
+    else:
+        frames = [contents]
+        frame_mime = content_type or "image/jpeg"
+
+    if not frames:
+        return ""
+
+    summary = await _ollama_vision(frames, is_video)
+    if summary:
+        return summary
+
+    if not is_video:
+        api_key = os.getenv("OPENAI_API_KEY")
+        if api_key:
+            summary = await _openai_vision(frames[0], frame_mime, api_key)
+            if summary:
+                return summary
+
+    summary = await _blip_vision(frames, is_video)
+    return summary or ""
 
 
 async def _vision_summary(media: UploadFile) -> str:

@@ -64,7 +64,7 @@ def preload_local_model():
 # ---------------------------------------------------------------------------
 
 _DEFAULT_HOST = "http://localhost:11434"
-_DEFAULT_MODEL = "llama3.2"
+_DEFAULT_MODEL = "qwen3.5:4b"
 
 
 def _ollama_host() -> str:
@@ -135,22 +135,26 @@ async def _ollama_explanation(
     prompt = _build_prompt(post, prediction, similar_posts, key_factors,
                            brand_stats, brand_alignment_score)
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(timeout=60.0) as client:
         resp = await client.post(
-            f"{host}/api/generate",
+            f"{host}/api/chat",
             json={
                 "model": model,
-                "prompt": prompt,
+                "messages": [{"role": "user", "content": prompt}],
                 "stream": False,
+                "think": False,
                 "options": {
                     "temperature": 0.4,
-                    "num_predict": 200,
+                    "num_predict": 150,
                 },
             },
         )
         resp.raise_for_status()
         data = resp.json()
-        return data["response"].strip()
+        content = data.get("message", {}).get("content", "").strip()
+        if not content:
+            raise ValueError("Empty response from Ollama")
+        return content
 
 
 # ---------------------------------------------------------------------------
@@ -243,11 +247,11 @@ def _build_prompt(
     content_group = prediction.get("model_details", {}).get("content_group", "reel")
 
     sim_context = ""
-    for i, sp in enumerate(similar_posts[:3], 1):
+    for i, sp in enumerate(similar_posts[:2], 1):
         sim_context += f"  {i}. '{sp['caption_snippet']}' → {sp['engagement_rate']}% ER ({sp['performance_tier']})\n"
 
-    positives = [f for f in key_factors if f["impact"] == "positive"][:3]
-    negatives = [f for f in key_factors if f["impact"] == "negative"][:3]
+    positives = [f for f in key_factors if f["impact"] == "positive"][:2]
+    negatives = [f for f in key_factors if f["impact"] == "negative"][:2]
     factor_context = ""
     if positives:
         factor_context += "Positive signals: " + ", ".join(f["description"] for f in positives) + ".\n"
