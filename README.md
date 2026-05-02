@@ -32,12 +32,15 @@ The `train.py` script trains the model, runs full evaluation, and saves both the
 ## Architecture
 
 ```
-POST /api/predict/upload    (multipart — with optional image upload)
-POST /api/predict           (JSON body)
+POST /api/predict           (JSON body — streaming-ready)
+POST /api/predict/stream    (JSON body — NDJSON stream, scores in ~330 ms)
+POST /api/predict/upload    (multipart — with optional file/URL upload)
+POST /api/analyze-media     (multipart — returns auto-generated visual description)
 POST /brands/register       (register a new brand with seed posts — cold start)
 GET  /brands                → list of known brands
 GET  /api/dataset/stats     → per-brand engagement statistics
 GET  /api/evaluation        → pre-computed evaluation results
+GET  /health                → model + LLM status
 ```
 
 ### System Diagram
@@ -318,18 +321,18 @@ A careful audit of the data and model revealed several non-obvious problems:
 assignment/
 ├── backend/
 │   ├── config.py               # Paths and constants
-│   ├── main.py                 # FastAPI application + brand registration endpoint
+│   ├── main.py                 # FastAPI application — prediction, streaming, media analysis, brand registration
 │   ├── data/
 │   │   ├── loader.py           # Dataset parsing → DataFrame
-│   │   └── features.py         # Feature extraction (26 structured features)
+│   │   └── features.py         # Feature extraction (26 structured features + embedding text builder)
 │   ├── models/
 │   │   └── predictor.py        # HybridPredictor (Ridge + KNN + brand centroids)
 │   ├── llm/
-│   │   └── explainer.py        # LLM explanation layer (GPT-4o-mini, falls back to template)
+│   │   └── explainer.py        # LLM explanation layer (Ollama → local HF model → template fallback)
 │   └── evaluation/
 │       └── evaluator.py        # LOBO CV, baselines, failure analysis
 ├── frontend/
-│   └── index.html              # Single-page prediction UI
+│   └── index.html              # Single-page prediction UI with streaming support
 ├── saved_models/
 │   ├── hybrid_predictor.joblib  # Trained model
 │   └── evaluation_results.json  # Full evaluation output
@@ -343,6 +346,8 @@ assignment/
 ## API Reference
 
 ### `POST /api/predict`
+
+Standard JSON prediction endpoint. Returns the full result once both the ML prediction and LLM explanation are complete (~10s with Ollama explanation).
 
 ```json
 {
@@ -380,12 +385,35 @@ assignment/
 }
 ```
 
+### `POST /api/predict/stream`
+
+**Recommended for the frontend.** Same JSON body as `/api/predict`. Returns a newline-delimited JSON (NDJSON) stream:
+
+1. `{"event": "prediction", ...full prediction object...}` — emitted immediately after ML scoring (~330 ms)
+2. `{"event": "explanation_token", "token": "..."}` — one per LLM token as it generates
+3. `{"event": "done"}` — stream complete
+
+This allows the UI to render scores in under a second and stream the explanation text live as it is generated.
+
 ### `POST /api/predict/upload`
 
-Same fields as above but as `multipart/form-data`. Accepts an optional `image` file. If `OPENAI_API_KEY` is set, the image is described via GPT-4o-mini Vision and the description is used for embedding.
+Same fields as `/api/predict` but as `multipart/form-data`. Accepts an optional media file (`media_file`) or a public URL (`media_url`). The visual description is derived in this priority order:
+
+1. `visual_summary` form field (user-typed) — highest priority
+2. `media_url` — fetched and processed via vision pipeline
+3. `media_file` — uploaded file processed via vision pipeline
+4. Empty string — prediction still works without visual context
 
 Additional fields:
 - `collaborator_follower_count` (int, optional): Enables collaborator tier score adjustment (+0.03 to +0.15)
+
+### `POST /api/analyze-media`
+
+Accepts `media_file` (upload) or `media_url` (public URL). Returns an auto-generated visual description using the vision model pipeline (see Visual Analysis section below).
+
+```json
+{ "visual_summary": "Two friends on a rooftop holding Sprite bottles..." }
+```
 
 ### `POST /brands/register`
 
@@ -420,10 +448,15 @@ Register a new brand (cold-start onboarding) or add seed posts to an existing br
 
 ```env
 # Ollama (local LLM — for explanation generation)
-OLLAMA_HOST=http://localhost:11434   # default; change if Ollama runs elsewhere
-OLLAMA_MODEL=llama3.2               # any model you have pulled, e.g. mistral, qwen2.5
+OLLAMA_HOST=http://localhost:11434      # default; change if Ollama runs elsewhere
+OLLAMA_MODEL=qwen3.5:4b                # any text model you have pulled
+OLLAMA_VISION_MODEL=llava              # vision model for /api/analyze-media (optional)
 
-# OpenAI (only needed for image → visual summary via GPT-4o-mini Vision)
+# Local HuggingFace fallback (used if Ollama is unavailable)
+LOCAL_LLM_MODEL=Qwen/Qwen2.5-1.5B-Instruct   # override default local model
+LOCAL_LLM_ENABLED=true                         # set to "false" to skip
+
+# OpenAI (optional — for image → visual summary via GPT-4o-mini Vision)
 OPENAI_API_KEY=sk-...
 ```
 
@@ -431,25 +464,42 @@ OPENAI_API_KEY=sk-...
 
 The system tries each option in order, falling back gracefully:
 
-**Option 1 — Local HuggingFace model (zero install, recommended)**
-
-No sudo, no server. Uses `transformers` (already installed). Downloads the model once (~900 MB) and caches it. Runs on Apple MPS GPU automatically.
+**Option 1 — Ollama (recommended, already installed)**
 
 ```bash
-# Nothing to install — just start the server and make a prediction.
-# Model downloads automatically on the first request that triggers explanation.
-# Default model: Qwen/Qwen2.5-1.5B-Instruct
-# Override: LOCAL_LLM_MODEL=Qwen/Qwen2.5-3B-Instruct  (larger / better)
+# Pull any model you prefer
+ollama pull qwen3.5:4b   # default — fast, good quality, thinking disabled at runtime
+# ollama pull llama3.2   # alternative
+
+# Ollama serve is started automatically by the Ollama app
+# Override model: OLLAMA_MODEL=mistral uvicorn backend.main:app ...
 ```
 
-**Option 2 — Ollama (if you can install it)**
+> **Note for qwen3 / thinking models:** The system uses the `/api/chat` endpoint with `think: false` automatically — no configuration needed.
+
+**Option 2 — Local HuggingFace model (zero install, no server)**
+
+No sudo, no Ollama. Uses `transformers` (already in `requirements.txt`). Downloads once (~900 MB) and caches it. Runs on Apple MPS / CUDA automatically. Falls back to this if Ollama is unreachable.
 
 ```bash
-curl -fsSL https://ollama.com/install.sh | sudo sh
-ollama pull llama3.2
-ollama serve
+# Nothing to install — model downloads automatically on the first prediction.
+# Default: Qwen/Qwen2.5-1.5B-Instruct
 ```
 
 **Option 3 — Template fallback**
 
-Always available. No model needed. Produces structured but less fluent text.
+Always available. No model, no API key. Produces structured but less fluent text.
+
+---
+
+### Visual Analysis Pipeline
+
+When a user uploads a file or provides a URL, the system auto-generates a visual description via this pipeline (first success wins):
+
+1. **Ollama vision model** (`OLLAMA_VISION_MODEL`, default `llava`) — local, free, handles both images and video frames
+2. **OpenAI GPT-4o-mini Vision** — if `OPENAI_API_KEY` is set (images only)
+3. **BLIP** (`Salesforce/blip-image-captioning-base`) — local HuggingFace model, always available, runs on Apple MPS
+
+For video files, 3 keyframes are extracted (at 20%, 50%, 80% of duration) via OpenCV and each is described separately.
+
+The user can always override the auto-generated description by typing their own in the "Override visual description" field — user text takes priority over all auto-generated summaries.
