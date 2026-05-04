@@ -618,7 +618,16 @@ function buildPayload() {
   if (postedAt) payload.posted_at = new Date(postedAt).toISOString();
 
   const override = document.getElementById('visual_summary_override').value.trim();
-  if (override) payload.visual_summary = override;
+  if (override) {
+    payload.visual_summary = override;
+  } else {
+    // Use the AI-analyzed visual summary if available and not still loading
+    const vaEl = document.getElementById('va-text');
+    const vaBox = document.getElementById('visual-analysis-box');
+    const isAnalyzed = vaBox && vaBox.style.display !== 'none' &&
+      vaEl && !vaEl.querySelector('span') && vaEl.textContent.trim();
+    if (isAnalyzed) payload.visual_summary = vaEl.textContent.trim();
+  }
 
   return payload;
 }
@@ -635,22 +644,39 @@ async function submitPrediction() {
   btn.disabled = true;
   btn.innerHTML = '<span class="spinner"></span>Predicting…';
 
-  // If a file or URL is provided, fall back to the multipart upload endpoint
-  // (streaming endpoint uses JSON body so can't carry a file)
-  const mediaFile = document.getElementById('media-file').files[0];
-  const mediaUrl  = document.getElementById('media-url').value.trim();
-  const hasMedia  = mediaFile || (mediaUrl && document.getElementById('pane-url').style.display !== 'none');
+  // If a visual summary was already generated (from file upload or URL analysis),
+  // inject it into the payload and use the fast streaming path directly.
+  // Only fall back to the multipart upload endpoint if no analysis has been done yet.
+  const mediaFile    = document.getElementById('media-file').files[0];
+  const mediaUrl     = document.getElementById('media-url').value.trim();
+  const isUploadPane = document.getElementById('pane-upload').style.display !== 'none';
+  const isUrlPane    = document.getElementById('pane-url').style.display !== 'none';
 
-  if (hasMedia) {
-    // ── Multipart path (file / URL upload) — non-streaming ──
+  // Check if AI analysis box has a real result (not still loading, not empty)
+  const vaEl  = document.getElementById('va-text');
+  const vaBox = document.getElementById('visual-analysis-box');
+  const alreadyAnalyzed = vaBox && vaBox.style.display !== 'none' &&
+    vaEl && !vaEl.querySelector('span') && vaEl.textContent.trim();
+
+  // Only use the slow upload path if media is present AND the analysis box
+  // has never been shown (i.e. the user hasn't even tried to analyze it yet).
+  // If analysis was attempted (box visible, even if it failed), we use the
+  // streaming path — the visual summary will just be empty if analysis failed.
+  const analysisAttempted = vaBox && vaBox.style.display !== 'none';
+  const hasUnanalyzedMedia =
+    (isUploadPane && mediaFile && !analysisAttempted) ||
+    (isUrlPane && mediaUrl && !analysisAttempted);
+
+  if (hasUnanalyzedMedia) {
+    // ── Multipart path — only used when media hasn't been pre-analyzed ──
     const form = new FormData();
     const p = buildPayload();
     Object.entries(p).forEach(([k, v]) => {
       if (Array.isArray(v)) form.append(k, v.join(','));
       else if (v !== undefined && v !== null) form.append(k, v);
     });
-    if (mediaFile) form.append('media_file', mediaFile);
-    if (mediaUrl && !mediaFile) form.append('media_url', mediaUrl);
+    if (isUploadPane && mediaFile) form.append('media_file', mediaFile);
+    if (isUrlPane && mediaUrl)     form.append('media_url', mediaUrl);
 
     try {
       const res = await fetch(`${API}/api/predict/upload`, { method: 'POST', body: form });
@@ -665,7 +691,7 @@ async function submitPrediction() {
     return;
   }
 
-  // ── Streaming path (no media file) ──
+  // ── Streaming path — used for all requests where visual summary is already known ──
   try {
     const res = await fetch(`${API}/api/predict/stream`, {
       method: 'POST',
@@ -762,10 +788,16 @@ function renderResult(d, streaming = false) {
     ${explanationHtml}
   `;
 
-  // Warnings (e.g. unknown brand)
+  // Warnings (e.g. unknown brand, mismatch)
+  const mismatch = (d.model_details || {}).brand_mismatch;
   if (d.warnings && d.warnings.length) {
     d.warnings.forEach(w => {
-      html += `<div style="background:rgba(229,160,74,0.1);border:1px solid rgba(229,160,74,0.3);border-radius:8px;padding:12px;font-size:13px;color:var(--med);margin-bottom:16px">⚠️ ${w}</div>`;
+      // Brand mismatch warnings are high-severity — show in red
+      const isMismatch = mismatch && w === mismatch.message;
+      const bg    = isMismatch ? 'rgba(224,92,92,0.12)'  : 'rgba(229,160,74,0.1)';
+      const bdr   = isMismatch ? 'rgba(224,92,92,0.35)'  : 'rgba(229,160,74,0.3)';
+      const color = isMismatch ? 'var(--low)'             : 'var(--med)';
+      html += `<div style="background:${bg};border:1px solid ${bdr};border-radius:8px;padding:12px;font-size:13px;color:${color};margin-bottom:16px">${w}</div>`;
     });
   }
 
@@ -829,6 +861,10 @@ function renderResult(d, streaming = false) {
   const alignLabel = alignScore != null
     ? `${(alignScore*100).toFixed(0)}% ${alignScore < 0.30 ? '⚠️ atypical' : '✓ on-brand'}`
     : 'N/A';
+  const mismatchRow = mismatch
+    ? `<div style="grid-column:1/-1;color:var(--low)">Brand mismatch: <b>${mismatch.type} signal</b> → suspected <b>${mismatch.suspected_brand}</b> (confidence ${(mismatch.confidence*100).toFixed(0)}%)</div>`
+    : '';
+
   html += `
     <div class="section-label">Model Internals</div>
     <div style="font-size:12px;color:var(--muted);background:var(--surface2);border-radius:8px;padding:12px;display:grid;grid-template-columns:1fr 1fr;gap:8px">
@@ -838,6 +874,7 @@ function renderResult(d, streaming = false) {
       <div>Tier boost: <b style="color:var(--accent2)">${md.collab_tier_adjustment > 0 ? '+'+md.collab_tier_adjustment : '—'}</b></div>
       <div>Brand alignment: <b style="color:var(--text)">${alignLabel}</b></div>
       <div>Known brand: <b style="color:var(--text)">${md.known_brand ? 'Yes' : 'No'}</b></div>
+      ${mismatchRow}
     </div>
   `;
 

@@ -452,6 +452,7 @@ async def _enrich_explanation(post: dict, result: dict, p: HybridPredictor) -> d
             key_factors=exp.get("key_factors", []),
             brand_stats=brand_stats,
             brand_alignment_score=alignment,
+            use_local_llm=False,
         )
         result["explanation"]["summary"] = llm_summary
     except Exception as e:
@@ -504,7 +505,7 @@ async def _vision_summary_from_url(url: str) -> str:
     is_video = content_type.startswith("video/") or ext in VIDEO_EXTS
 
     if is_video:
-        frames = _extract_video_frames(contents)
+        frames = _extract_video_frames(contents, filename=ext and f"video.{ext}")
         frame_mime = "image/jpeg"
     else:
         frames = [contents]
@@ -535,17 +536,18 @@ async def _vision_summary(media: UploadFile) -> str:
     Priority:
       1. Ollama vision model (llava) — local, free, works for both image and video frames
       2. OpenAI GPT-4o-mini Vision — if OPENAI_API_KEY is set (images only)
-      3. Empty string — graceful fallback when neither is available
+      3. Local BLIP model — always available after startup warm-up
     """
     contents = await media.read()
     content_type = media.content_type or ""
-    is_video = content_type.startswith("video/") or media.filename.lower().rsplit(".", 1)[-1] in (
-        "mp4", "mov", "avi", "webm", "mkv"
-    )
+    filename = media.filename or ""
+    VIDEO_EXTS = {"mp4", "mov", "avi", "webm", "mkv", "m4v"}
+    ext = filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
+    is_video = content_type.startswith("video/") or ext in VIDEO_EXTS
 
     # Extract frames: for video pull 3 keyframes; for image use the file directly
     if is_video:
-        frames = _extract_video_frames(contents)
+        frames = _extract_video_frames(contents, filename=filename)
         frame_mime = "image/jpeg"
     else:
         frames = [contents]
@@ -575,37 +577,67 @@ async def _vision_summary(media: UploadFile) -> str:
     return ""
 
 
-def _extract_video_frames(video_bytes: bytes, n_frames: int = 3) -> list:
+def _extract_video_frames(video_bytes: bytes, n_frames: int = 3, filename: str = "") -> list:
     """
     Extract n evenly-spaced keyframes from a video as JPEG bytes.
-    Returns an empty list if cv2 is not installed or the video can't be decoded.
+
+    Two seeking strategies are tried in order:
+      1. Frame-based seeking  — requires a valid CAP_PROP_FRAME_COUNT (fast, precise)
+      2. Ratio-based seeking  — uses CAP_PROP_POS_AVI_RATIO (works when frame count is
+         unavailable, e.g. VBR-encoded Instagram reels and many real-world MP4s)
+
+    Falls back to reading the very first decodable frame if ratio seeking also fails.
+    Returns an empty list only if cv2 is not installed or the file is unreadable.
     """
     try:
         import cv2
-        import numpy as np
         import tempfile, os as _os
 
-        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
+        # Preserve the original extension so FFMPEG picks the right demuxer
+        ext = ("." + filename.rsplit(".", 1)[-1]) if filename and "." in filename else ".mp4"
+        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as f:
             f.write(video_bytes)
             tmp_path = f.name
 
         try:
             cap = cv2.VideoCapture(tmp_path)
-            total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            if total == 0:
-                cap.release()
+            if not cap.isOpened():
+                logger.warning("OpenCV could not open video file (codec/format unsupported)")
                 return []
 
+            total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             frames = []
-            for i in range(n_frames):
-                # Sample at 20%, 50%, 80% through the video
-                pos = int(total * (i + 1) / (n_frames + 1))
-                cap.set(cv2.CAP_PROP_POS_FRAMES, pos)
-                ret, frame = cap.read()
-                if ret:
-                    _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
-                    frames.append(bytes(buf))
+
+            if total > 0:
+                # Strategy 1: frame-based seeking (most formats)
+                for i in range(n_frames):
+                    pos = int(total * (i + 1) / (n_frames + 1))
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, pos)
+                    ret, frame = cap.read()
+                    if ret:
+                        _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
+                        frames.append(bytes(buf))
+            else:
+                # Strategy 2: ratio-based seeking (VBR MP4s, many Instagram reels)
+                for ratio in [0.2, 0.5, 0.8]:
+                    cap.set(cv2.CAP_PROP_POS_AVI_RATIO, ratio)
+                    ret, frame = cap.read()
+                    if ret:
+                        _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
+                        frames.append(bytes(buf))
+
+                # Strategy 3: just grab the first decodable frame
+                if not frames:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    ret, frame = cap.read()
+                    if ret:
+                        _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
+                        frames.append(bytes(buf))
+
             cap.release()
+
+            if not frames:
+                logger.warning("Video frame extraction produced no frames (total=%d, file=%s)", total, ext)
             return frames
         finally:
             _os.unlink(tmp_path)

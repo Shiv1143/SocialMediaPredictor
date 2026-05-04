@@ -94,31 +94,36 @@ async def generate_explanation(
     key_factors: list,
     brand_stats: dict,
     brand_alignment_score: Optional[float] = None,
+    use_local_llm: bool = False,
 ) -> str:
     """
     Generate a human-readable explanation for the prediction.
 
     Priority:
-      1. Ollama (if server is reachable)
-      2. Local HuggingFace model via transformers (Qwen2.5-1.5B-Instruct by default)
-      3. Template fallback
+      1. Ollama (if server is reachable) — fast, streaming-friendly
+      2. Local HuggingFace model — only when use_local_llm=True (slow, ~8-10s)
+      3. Template fallback — always available, instant
+
+    The local LLM is disabled by default for request-path calls to keep
+    latency predictable. It is only used when explicitly opted-in (e.g.
+    background pre-generation) or when the caller can afford the wait.
     """
     args = (post, prediction, similar_posts, key_factors, brand_stats, brand_alignment_score)
 
-    # 1. Try Ollama
+    # 1. Try Ollama (fast, <2s when running)
     try:
         return await _ollama_explanation(*args)
     except Exception as e:
-        logger.debug("Ollama not available (%s), trying local model", e)
+        logger.debug("Ollama not available (%s), falling back", e)
 
-    # 2. Try local transformers model
-    if _local_llm_enabled():
+    # 2. Local transformers model — only when explicitly allowed
+    if use_local_llm and _local_llm_enabled():
         try:
             return await _local_explanation(*args)
         except Exception as e:
             logger.warning("Local model explanation failed (%s), using template fallback", e)
 
-    # 3. Template fallback
+    # 3. Template fallback (instant)
     return _template_explanation(*args)
 
 

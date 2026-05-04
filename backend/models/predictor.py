@@ -225,13 +225,20 @@ class HybridPredictor:
         collab_adjustment = tier_adjustments.get(collaborator_tier, 0.0)
         final_score = float(np.clip(base_score + collab_adjustment, 0.0, 1.0))
 
-        # ---------- Off-strategy detection (Item 4) ----------
+        # ---------- Off-strategy detection ----------
         brand_alignment_score = None
         is_off_strategy = False
         if brand in self.brand_centroids:
             centroid = self.brand_centroids[brand]
             brand_alignment_score = float(np.dot(query_emb, centroid))
             is_off_strategy = brand_alignment_score < 0.30
+
+        # ---------- Brand mismatch detection ----------
+        # Two independent signals are combined:
+        #   1. Keyword check  — caption or visual summary explicitly names a competitor
+        #   2. Centroid check — query embedding is semantically closer to a different
+        #                       brand's centroid than to the declared brand's centroid
+        mismatch = _detect_brand_mismatch(post, query_emb, brand, self.brand_centroids)
 
         tier = _score_to_tier(final_score)
         estimated_er = self._denormalize_er(final_score, brand, content_group)
@@ -243,6 +250,9 @@ class HybridPredictor:
         # Reduce confidence for off-strategy posts — less historical data to compare against
         if is_off_strategy:
             confidence *= 0.8
+        # Significantly reduce confidence when a brand mismatch is detected
+        if mismatch["detected"]:
+            confidence *= 0.4
 
         explanation = self._explain(
             post, features, sims, top_k_idx, top_k_sims,
@@ -254,6 +264,8 @@ class HybridPredictor:
         )
 
         warnings = []
+        if mismatch["detected"]:
+            warnings.append(mismatch["message"])
         if not known_brand:
             warnings.append(
                 f"Brand '{brand}' was not seen during training. "
@@ -266,7 +278,7 @@ class HybridPredictor:
                 "(ER = interactions/followers). This differs from reel ER (interactions/views) "
                 "and cannot be directly compared."
             )
-        if is_off_strategy:
+        if is_off_strategy and not mismatch["detected"]:
             warnings.append(
                 f"This post's content is atypical for {brand}'s usual style "
                 f"(brand alignment score: {brand_alignment_score:.2f}). "
@@ -290,6 +302,7 @@ class HybridPredictor:
                 "content_group": content_group,
                 "known_brand": known_brand,
                 "brand_alignment_score": round(brand_alignment_score, 3) if brand_alignment_score is not None else None,
+                "brand_mismatch": mismatch if mismatch["detected"] else None,
             },
         }
         if warnings:
@@ -622,6 +635,130 @@ def _score_to_tier(score: float) -> str:
     elif score <= 0.67:
         return "medium"
     return "high"
+
+
+# Brand name keywords for explicit mention detection.
+# Each entry maps brand username → set of lowercase tokens that unambiguously
+# identify that brand in a caption or visual summary.
+_BRAND_KEYWORDS: dict = {
+    "cocacola_india":    {"coca-cola", "coca cola", "cocacola", "coke"},
+    "pepsiindia":        {"pepsi"},
+    "sprite_india":      {"sprite"},
+    "redbullindia":      {"red bull", "redbull"},
+    "thumsupofficial":   {"thums up", "thumsup", "thums-up", "thumps up"},
+}
+
+# Minimum cosine-similarity gap between the closest centroid and the
+# declared brand's centroid to flag a centroid-based mismatch.
+_CENTROID_MISMATCH_GAP = 0.08
+
+
+def _detect_brand_mismatch(
+    post: dict,
+    query_emb: np.ndarray,
+    declared_brand: str,
+    brand_centroids: dict,
+) -> dict:
+    """
+    Detect when the content (caption + visual summary) does not match the
+    declared brand.  Two independent signals are checked:
+
+    1. Keyword signal — caption or visual summary explicitly names a
+       competitor brand.  High-confidence, zero false-positives for clear
+       mentions (e.g. "Sprite" in a Thums Up post).
+
+    2. Centroid signal — the post's embedding is measurably closer to a
+       different brand's centroid than to the declared brand's centroid.
+       Catches implicit mismatches (e.g. extreme-sports visual style in a
+       cola brand post) without requiring an explicit name.
+
+    Returns a dict with:
+      detected        bool   — True if either signal fires
+      type            str    — 'keyword' | 'centroid' | 'both'
+      suspected_brand str    — brand that the content looks like
+      confidence      float  — 0–1 confidence in the mismatch signal
+      message         str    — human-readable warning
+    """
+    result = {"detected": False, "type": None, "suspected_brand": None,
+              "confidence": 0.0, "message": ""}
+
+    text_to_check = " ".join([
+        (post.get("caption") or ""),
+        (post.get("visual_summary") or ""),
+    ]).lower()
+
+    # ── Signal 1: keyword match ──
+    keyword_hit_brand = None
+    for brand, keywords in _BRAND_KEYWORDS.items():
+        if brand == declared_brand:
+            continue
+        for kw in keywords:
+            if kw in text_to_check:
+                keyword_hit_brand = brand
+                break
+        if keyword_hit_brand:
+            break
+
+    # ── Signal 2: centroid similarity ──
+    centroid_hit_brand = None
+    centroid_gap = 0.0
+    if brand_centroids:
+        sims = {b: float(np.dot(query_emb, c)) for b, c in brand_centroids.items()}
+        best_brand = max(sims, key=sims.get)
+        declared_sim = sims.get(declared_brand, 0.0)
+        best_sim = sims.get(best_brand, 0.0)
+        centroid_gap = best_sim - declared_sim
+        if best_brand != declared_brand and centroid_gap >= _CENTROID_MISMATCH_GAP:
+            centroid_hit_brand = best_brand
+
+    # ── Combine signals ──
+    if keyword_hit_brand and centroid_hit_brand:
+        suspected = keyword_hit_brand  # keyword is more precise; prefer it
+        signal_type = "both"
+        confidence = min(0.95, 0.75 + centroid_gap)
+        message = (
+            f"⚠️ Brand mismatch detected (high confidence): "
+            f"the caption/visual explicitly mentions '{keyword_hit_brand.replace('_',' ')}', "
+            f"and the content embedding is also semantically closer to "
+            f"'{centroid_hit_brand.replace('_',' ')}' than to '{declared_brand.replace('_',' ')}' "
+            f"(gap: {centroid_gap:.2f}). "
+            f"Please verify that the caption and creative belong to {declared_brand.replace('_',' ')}. "
+            f"Prediction confidence has been reduced significantly."
+        )
+    elif keyword_hit_brand:
+        suspected = keyword_hit_brand
+        signal_type = "keyword"
+        confidence = 0.90
+        message = (
+            f"⚠️ Brand mismatch detected: the caption or visual summary contains "
+            f"'{keyword_hit_brand.replace('_',' ')}' — a competitor brand — "
+            f"but the declared brand is '{declared_brand.replace('_',' ')}'. "
+            f"If this is intentional (e.g. a comparative ad), ignore this warning. "
+            f"Otherwise, please verify the inputs. Prediction confidence has been reduced."
+        )
+    elif centroid_hit_brand:
+        suspected = centroid_hit_brand
+        signal_type = "centroid"
+        confidence = min(0.80, 0.50 + centroid_gap * 3)
+        message = (
+            f"⚠️ Possible brand mismatch: the content's style and themes are more similar "
+            f"to '{centroid_hit_brand.replace('_',' ')}' than to '{declared_brand.replace('_',' ')}' "
+            f"(centroid similarity gap: {centroid_gap:.2f}). "
+            f"This may indicate the wrong brand was selected, or that this post's creative "
+            f"is unusually atypical for {declared_brand.replace('_',' ')}. "
+            f"Prediction confidence has been reduced."
+        )
+    else:
+        return result
+
+    result.update({
+        "detected": True,
+        "type": signal_type,
+        "suspected_brand": suspected,
+        "confidence": round(confidence, 3),
+        "message": message,
+    })
+    return result
 
 
 def _feature_label(feat: str, value) -> str:
